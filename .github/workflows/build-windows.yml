@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build DuoStar Basic Windows EXE
 
 on:
   workflow_dispatch:
@@ -25,20 +25,20 @@ jobs:
         shell: cmd
         run: |
           pyinstaller --noconfirm --clean --windowed --onefile ^
-            --name "Seestar Double Star Analyzer Basic" ^
+            --name "DuoStar Basic" ^
             --collect-all astropy ^
             --collect-all photutils ^
-            Seestar_Double_Star_Analyzer_Basic_GUI.py
+            DuoStar_Basic_GUI_EN.py
 
       - name: Prepare release files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item "dist\Seestar Double Star Analyzer Basic.exe" "release\Seestar Double Star Analyzer Basic.exe"
+          Copy-Item "dist\DuoStar Basic.exe" "release\DuoStar Basic.exe"
           Copy-Item "Seestar_wds.csv" "release\Seestar_wds.csv"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Seestar-Double-Star-Analyzer-Basic-Windows
+          name: DuoStar-Basic-Windows
           path: release
