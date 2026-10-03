@@ -2222,10 +2222,26 @@ def build_umbra_pipeline(
     )
 
     # Only Q4-Q5 primary umbrae seed the secure pattern.
-    secure = strong_all[
-        (strong_all["detection_quality"] >= CFG.strong_seed_quality_min)
+        # 6.1.2: very small but coherent inner-disk strong umbrae may score only Q2
+    # because their area is tiny. Accept these only well inside the disk.
+    inner_q2_strong = (
+        (strong_all["detection_source"] == "strong_umbra")
+        & (strong_all["detection_quality"] == 2)
         & strong_all["inside_activity_latitude_band"]
+        & (strong_all["r_norm"] <= 0.70)
+    )
+
+    secure = strong_all[
+        (
+            strong_all["detection_quality"] >= CFG.strong_seed_quality_min
+        )
+        | inner_q2_strong
     ].copy().reset_index(drop=True)
+    
+    # secure = strong_all[
+        # (strong_all["detection_quality"] >= CFG.strong_seed_quality_min)
+        # & strong_all["inside_activity_latitude_band"]
+    # ].copy().reset_index(drop=True)
 
     if secure.empty:
         candidates = strong_all.copy()
