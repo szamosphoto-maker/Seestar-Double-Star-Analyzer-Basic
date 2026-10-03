@@ -2,9 +2,8 @@
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
-# The GUI loads the three processing modules dynamically from bundled .py files.
-# Listing them as hidden imports makes PyInstaller ANALYZE their imports too,
-# so dependencies such as zoneinfo are not omitted from the executable.
+# The processing modules are imported from the PyInstaller bundle when frozen.
+# Hidden imports force PyInstaller to analyse and package them and their dependencies.
 hiddenimports = [
     "sunspot",
     "halpha",
@@ -28,13 +27,11 @@ hiddenimports += collect_submodules("scipy.ndimage")
 hiddenimports += collect_submodules("astropy.table")
 hiddenimports += collect_submodules("zoneinfo")
 
-# Windows has no system IANA timezone database.  ZoneInfo therefore needs the
-# data shipped by the tzdata package (e.g. Europe/Budapest).
+# Windows has no system IANA timezone database, therefore bundle tzdata.
+# Only the icon is needed as a loose data file; processing .py files are compiled
+# into the executable through hiddenimports above.
 datas = collect_data_files("tzdata")
 datas += [
-    ("sunspot.py", "."),
-    ("halpha.py", "."),
-    ("combine_sunspot.py", "."),
     ("sesuco.ico", "."),
 ]
 

@@ -15,6 +15,7 @@ an easy Windows-style interface around them.
 from __future__ import annotations
 
 import csv
+import importlib
 import importlib.util
 import os
 import sys
@@ -106,6 +107,22 @@ def find_module_file(kind: str) -> Path:
 
 
 def load_module(kind: str):
+    # In a PyInstaller executable always use the module compiled into the EXE.
+    # Never prefer a stray/older .py file sitting beside SeSuCo.exe.
+    if getattr(sys, "frozen", False):
+        module_names = {
+            "sunspot": "sunspot",
+            "halpha": "halpha",
+            "combine": "combine_sunspot",
+        }
+        if kind not in module_names:
+            raise ValueError(kind)
+        module = importlib.import_module(module_names[kind])
+        enable_unicode_cv2_io(module)
+        module_path = Path(getattr(module, "__file__", module_names[kind]))
+        return module, module_path
+
+    # Normal Python/development mode: load the processing script from disk.
     path = find_module_file(kind)
     module_name = f"sesuco_{kind}_module"
     spec = importlib.util.spec_from_file_location(module_name, path)
