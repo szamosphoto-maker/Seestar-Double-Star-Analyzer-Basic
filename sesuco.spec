@@ -1,8 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
+# The GUI loads the three processing modules dynamically from bundled .py files.
+# Listing them as hidden imports makes PyInstaller ANALYZE their imports too,
+# so dependencies such as zoneinfo are not omitted from the executable.
 hiddenimports = [
+    "sunspot",
+    "halpha",
+    "combine_sunspot",
     "cv2",
     "numpy",
     "pandas",
@@ -12,24 +18,31 @@ hiddenimports = [
     "astropy.table",
     "matplotlib",
     "matplotlib.pyplot",
+    "zoneinfo",
+    "zoneinfo._common",
+    "zoneinfo._tzpath",
     "tzdata",
 ]
 
-# Dynamic processing modules import parts of these packages, so include their
-# submodules explicitly for a robust one-file build.
 hiddenimports += collect_submodules("scipy.ndimage")
 hiddenimports += collect_submodules("astropy.table")
+hiddenimports += collect_submodules("zoneinfo")
+
+# Windows has no system IANA timezone database.  ZoneInfo therefore needs the
+# data shipped by the tzdata package (e.g. Europe/Budapest).
+datas = collect_data_files("tzdata")
+datas += [
+    ("sunspot.py", "."),
+    ("halpha.py", "."),
+    ("combine_sunspot.py", "."),
+    ("sesuco.ico", "."),
+]
 
 a = Analysis(
     ["sesuco_gui.py"],
-    pathex=[],
+    pathex=["."],
     binaries=[],
-    datas=[
-        ("sunspot.py", "."),
-        ("halpha.py", "."),
-        ("combine_sunspot.py", "."),
-        ("sesuco.ico", "."),
-    ],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
