@@ -586,78 +586,140 @@ def fit_single_star_centroid(
     x0: float,
     y0: float,
     fwhm_guess: float,
+    nearby_sources=None,
 ) -> tuple[float, float, float]:
+    """Adaptive, masked single-star PSF fit for WIDE pairs only.
+
+    Excludes the cores of nearby DAO sources and saturated pixels, rather
+    than shrinking an aperture until almost no stellar profile remains.
+    Returns a centroid only when sufficient usable pixels and a stable fit
+    remain. Original two-star PSF algorithm is untouched.
     """
-    Egy különálló csillag lokális centroid/PSF becslése kis kivágáson.
-    Széles párokhoz használjuk, ahol nincs értelme közös kétcsillagos fitnek.
-    """
+    x0, y0 = float(x0), float(y0)
     ny, nx = data.shape
-    half = max(6, int(math.ceil(2.5 * float(fwhm_guess))))
+    fwhm = max(1.5, float(fwhm_guess))
+    half = max(8, int(math.ceil(3.2 * fwhm)))
+    xmin, xmax = int(math.floor(x0-half)), int(math.ceil(x0+half+1))
+    ymin, ymax = int(math.floor(y0-half)), int(math.ceil(y0+half+1))
+    if xmin < 0 or ymin < 0 or xmax > nx or ymax > ny:
+        raise ValueError('A csillag túl közel van a képszélhez.')
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    yy, xx = np.mgrid[ymin:ymax, xmin:xmax]
+    radius = np.hypot(xx-x0, yy-y0)
+    usable = np.isfinite(cut) & (radius <= 2.8*fwhm)
 
-    x_min = int(math.floor(x0 - half))
-    x_max = int(math.ceil(x0 + half + 1))
-    y_min = int(math.floor(y0 - half))
-    y_max = int(math.ceil(y0 + half + 1))
+    # Genuine 16-bit ADC saturation: never fit the clipped core as a Gaussian.
+    # The threshold is deliberately high to avoid discarding normal bright pixels.
+    saturated = bool(np.any(cut[radius <= 2*fwhm] >= 65000))
+    if saturated:
+        usable &= (cut < 65000)
 
-    if x_min < 0 or y_min < 0 or x_max > nx or y_max > ny:
-        raise ValueError("A csillag túl közel van a képszélhez.")
+    # Nearby, *distinct* DAO detections.  Restrict to the local PSF footprint;
+    # exclude their cores without excluding the target's own pixels.
+    neighbours = []
+    if nearby_sources is not None and len(nearby_sources):
+        xs = np.asarray(nearby_sources['xcentroid'], dtype=float)
+        ys = np.asarray(nearby_sources['ycentroid'], dtype=float)
+        dist = np.hypot(xs-x0, ys-y0)
+        for sx, sy, d in zip(xs, ys, dist):
+            if np.isfinite(d) and 2.0 <= d < half + 2*fwhm:
+                neighbours.append((float(sx), float(sy), float(d)))
+                exclusion = max(1.8, 0.85*fwhm)
+                usable &= np.hypot(xx-sx, yy-sy) > exclusion
 
-    cut = data[y_min:y_max, x_min:x_max]
-    _, background, noise = sigma_clipped_stats(cut, sigma=3.0)
-    if not np.isfinite(noise) or noise <= 0:
-        noise = max(float(np.nanstd(cut)), 1.0)
+    if np.count_nonzero(usable) < 25:
+        raise ValueError('Nincs elegendő ép pixel az adaptív PSF-illesztéshez.')
+    # Estimate background from *unmasked* distant pixels.
+    sky = cut[usable & (radius >= 1.8*fwhm)]
+    if sky.size < 12:
+        sky = cut[usable]
+    background = float(np.median(sky))
+    mad = float(np.median(np.abs(sky-background)))
+    noise = max(1.4826*mad, 1.0)
 
-    yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
-
-    peak = max(float(np.nanmax(cut) - background), noise)
-    sigma0 = max(float(fwhm_guess) / 2.35482, 0.7)
-
-    def model(params):
-        x, y, amp, sigma, bg = params
-        rr2 = (xx - x) ** 2 + (yy - y) ** 2
-        return bg + amp * np.exp(-0.5 * rr2 / (sigma ** 2))
-
+    fit_values = cut[usable]
+    fit_x, fit_y = xx[usable], yy[usable]
+    peak = max(float(np.max(fit_values)-background), noise)
+    sigma0 = max(fwhm / 2.35482, 0.7)
     p0 = np.array([x0, y0, peak, sigma0, background], dtype=float)
-    lower = np.array([
-        x0 - MAX_POSITION_SHIFT_PIX,
-        y0 - MAX_POSITION_SHIFT_PIX,
-        0.0,
-        0.45,
-        float(np.nanmin(cut)) - 5.0 * noise,
-    ])
-    upper = np.array([
-        x0 + MAX_POSITION_SHIFT_PIX,
-        y0 + MAX_POSITION_SHIFT_PIX,
-        max(peak * 5.0, float(np.nanmax(cut) - background) * 5.0),
-        max(8.0, 2.0 * float(fwhm_guess)),
-        float(np.nanmax(cut)),
-    ])
+    lower = [x0-MAX_POSITION_SHIFT_PIX, y0-MAX_POSITION_SHIFT_PIX,
+             0.0, 0.45, float(np.min(fit_values))-5*noise]
+    upper = [x0+MAX_POSITION_SHIFT_PIX, y0+MAX_POSITION_SHIFT_PIX,
+             max(peak*15.0, 1.0), max(8.0, 2*fwhm),
+             max(float(np.max(fit_values)), background+noise)]
+    p0 = np.clip(p0, np.asarray(lower)+1e-6, np.asarray(upper)-1e-6)
 
     def residuals(params):
-        return ((model(params) - cut) / noise).ravel()
+        x, y, amp, sig, bg = params
+        model = bg + amp*np.exp(-0.5*((fit_x-x)**2+(fit_y-y)**2)/sig**2)
+        return (model-fit_values)/noise
 
-    result = least_squares(
-        residuals,
-        p0,
-        bounds=(lower, upper),
-        loss="soft_l1",
-        f_scale=1.0,
-        max_nfev=2000,
-        xtol=1e-10,
-        ftol=1e-10,
-        gtol=1e-10,
-    )
-
+    result = least_squares(residuals, p0, bounds=(lower, upper),
+                           loss='soft_l1', f_scale=1.0, max_nfev=1500,
+                           xtol=1e-8, ftol=1e-8, gtol=1e-8)
     if not result.success:
-        raise RuntimeError(
-            f"Egycsillagos PSF-illesztés nem konvergált: {result.message}"
-        )
+        raise RuntimeError(f'Adaptív PSF-illesztés nem konvergált: {result.message}')
+    x, y, amp, sig, bg = (float(v) for v in result.x)
+    if amp <= 0 or not np.all(np.isfinite(result.x)):
+        raise ValueError('Nem megbízható PSF-paraméterek.')
+    if math.hypot(x-x0, y-y0) > MAX_POSITION_SHIFT_PIX:
+        raise ValueError('Az illesztett centroid túl távol került a detektált csillagtól.')
+    # Reject fits stuck on the allowed sigma or centroid limits.
+    if sig >= max(8.0, 2*fwhm)*0.99 or sig <= 0.46:
+        raise ValueError('Az illesztett PSF szélessége határértéken van.')
+    print(f'Adaptive PSF: centroid=({x:.3f},{y:.3f}), '
+          f'pixels={usable.sum()}, saturation={saturated}, '
+          f'nearby_DAO={len(neighbours)}, nfev={result.nfev}')
+    return x, y, amp
 
-    x, y, amp, sigma, bg = result.x
-    if amp <= 0:
-        raise ValueError("Nem pozitív illesztett csillagfluxus.")
 
-    return float(x), float(y), float(amp)
+def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, label):
+    """A wide-mode component must have a local, significant peak near WDS position.
+
+    Use DAO when possible; if saturated/weak sources are missed, use a tightly
+    bounded peak search. This never substitutes the other component and does
+    not bypass subsequent PSF fitting or WDS/photometric quality checks.
+    """
+    # Astropy WCS may return a zero-dimensional ndarray rather than a Python float.
+    # Convert scalar coordinates before round(), scalar masks and distance checks.
+    expected_x = float(np.asarray(expected_x).item())
+    expected_y = float(np.asarray(expected_y).item())
+    ny, nx = data.shape
+    radius = 3.0  # identical to the PSF centroid's MAX_POSITION_SHIFT_PIX
+    cx, cy = int(round(expected_x)), int(round(expected_y))
+    margin = 11
+    if cx - margin < 0 or cy - margin < 0 or cx + margin >= nx or cy + margin >= ny:
+        raise ValueError(f"{label}: nincs elég képfelület a csillag helyi vizsgálatához.")
+
+    yy, xx = np.mgrid[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
+    tile = data[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
+    rad = np.hypot(xx - expected_x, yy - expected_y)
+    sky = tile[(rad >= 7.0) & (rad <= 11.0) & np.isfinite(tile)]
+    if sky.size < 25:
+        raise ValueError(f"{label}: nem mérhető a lokális háttér.")
+    bg = float(np.median(sky))
+    mad = float(np.median(np.abs(sky-bg)))
+    noise = max(1.4826 * mad, float(np.std(sky)), 1.0)
+    local_mask = (rad <= radius) & np.isfinite(tile)
+    if not np.any(local_mask):
+        raise ValueError(f"{label}: nincs érvényes pixel a várt pozícióban.")
+    peak = float(np.max(tile[local_mask]))
+    snr = (peak-bg)/noise
+    if snr < 6.0:
+        raise ValueError(f"{label}: nem detektálható helyi fényességcsúcs (SNR={snr:.1f}).")
+    candidates = np.where(local_mask & (tile == peak))
+    idx = int(np.argmin(rad[candidates]))
+    py = float(yy[candidates][idx]); px = float(xx[candidates][idx])
+
+    # Prefer DAO source when it is also tightly associated with the local peak.
+    if sources is not None and len(sources):
+        sx = np.asarray(sources['xcentroid'], dtype=float)
+        sy = np.asarray(sources['ycentroid'], dtype=float)
+        dist = np.hypot(sx-px, sy-py)
+        j = int(np.argmin(dist))
+        if dist[j] <= 2.0 and math.hypot(sx[j]-expected_x, sy[j]-expected_y) <= radius:
+            return float(sx[j]), float(sy[j]), 'DAO'
+    return px, py, 'local peak'
 
 
 def measure_wide_pair(
@@ -683,21 +745,35 @@ def measure_wide_pair(
     if not all(np.isfinite([x_a_exp, y_a_exp, x_b_exp, y_b_exp])):
         raise ValueError("A várható komponenspozíció nem alakítható pixelkoordinátává.")
 
-    dao_a, dao_b = require_two_independent_sources(
-        sources=sources,
-        x_a_exp=x_a_exp,
-        y_a_exp=y_a_exp,
-        x_b_exp=x_b_exp,
-        y_b_exp=y_b_exp,
-        fwhm_guess=fwhm_guess,
+    dao_ax, dao_ay, method_a = locate_wide_component(
+        data, sources, x_a_exp, y_a_exp, fwhm_guess, 'A'
     )
+    dao_bx, dao_by, method_b = locate_wide_component(
+        data, sources, x_b_exp, y_b_exp, fwhm_guess, 'B/C'
+    )
+    sep_detected = math.hypot(dao_ax - dao_bx, dao_ay - dao_by)
+    sep_expected = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
+    if sep_detected < max(2.0, 0.7 * sep_expected):
+        raise ValueError('Széles pár: ugyanaz a forrás vagy hibás komponens-azonosítás.')
 
-    x_a, y_a, amp_a = fit_single_star_centroid(
-        data, dao_a[0], dao_a[1], fwhm_guess
-    )
-    x_b, y_b, amp_b = fit_single_star_centroid(
-        data, dao_b[0], dao_b[1], fwhm_guess
-    )
+    print(f'Wide identification: A={method_a} ({dao_ax:.2f}, {dao_ay:.2f}); '
+          f'B/C={method_b} ({dao_bx:.2f}, {dao_by:.2f})')
+    # Azonosítsuk pontosan, melyik komponens illesztése hibázik.
+    try:
+        x_a, y_a, amp_a = fit_single_star_centroid(
+            data, dao_ax, dao_ay, fwhm_guess, nearby_sources=sources
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Széles pár, A komponens PSF-illesztés: {exc}") from exc
+    try:
+        x_b, y_b, amp_b = fit_single_star_centroid(
+            data, dao_bx, dao_by, fwhm_guess, nearby_sources=sources
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Széles pár, társkomponens PSF-illesztés: {exc}") from exc
+    if (math.hypot(x_a-x_a_exp, y_a-y_a_exp) > 3.0 or
+            math.hypot(x_b-x_b_exp, y_b-y_b_exp) > 3.0):
+        raise ValueError('Széles pár: az illesztett csillagpozíció eltér a WDS alapján várttól.')
 
     coord_a = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode="all")
     coord_b = pixel_to_skycoord(x_b, y_b, wcs, origin=0, mode="all")
@@ -969,6 +1045,16 @@ def main() -> int:
             print(f"Delta mag:   {dmag:.2f} mag")
             print("Quality:     GOOD")
             print(f"\nTXT mentve: {out}")
+            # Optional image export: a failure here cannot invalidate a valid measurement.
+            try:
+                from duostar_annotation import create_annotated_image
+                png = create_annotated_image(
+                    data, wcs, row, x_a, y_a, x_b, y_b,
+                    out.with_name(out.stem.replace("_measurement", "_annotated") + ".png"),
+                )
+                print(f"PNG mentve: {png}")
+            except Exception as image_exc:
+                print(f"PNG nem készült: {image_exc}")
 
         except Exception as exc:
             print("\nMÉRÉS ELUTASÍTVA")

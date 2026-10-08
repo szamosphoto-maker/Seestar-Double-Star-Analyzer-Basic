@@ -108,7 +108,7 @@ class AnalyzerGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} — GUI v{GUI_VERSION}")
-        self.geometry("760x560")
+        self.geometry("760x585")
         self.minsize(720, 520)
 
         self.catalog = None
@@ -359,6 +359,17 @@ class AnalyzerGUI(tk.Tk):
             fit_path, row, obs_time, pa, rho, dmag
         )
 
+        png = None
+        image_error = None
+        try:
+            from duostar_annotation import create_annotated_image
+            png = create_annotated_image(
+                data, wcs, row, x_a, y_a, x_b, y_b,
+                out.with_name(out.stem.replace("_measurement", "_annotated") + ".png"),
+            )
+        except Exception as exc:
+            image_error = str(exc)
+
         return {
             "object": row.pair_name,
             "wds": row.wds_id,
@@ -367,6 +378,8 @@ class AnalyzerGUI(tk.Tk):
             "dmag": abs(float(dmag)),
             "quality": "GOOD",
             "saved": out,
+            "png": png,
+            "image_error": image_error,
         }
 
     def _measurement_success(self, result):
@@ -376,7 +389,12 @@ class AnalyzerGUI(tk.Tk):
         self.result_vars["Separation"].set(f'{result["rho"]:.2f}"')
         self.result_vars["Delta mag"].set(f'{result["dmag"]:.2f} mag')
         self.result_vars["Quality"].set(result["quality"])
-        self.saved_var.set(f'TXT mentve: {result["saved"]}')
+        saved_text = f'TXT mentve: {result["saved"]}'
+        if result["png"]:
+            saved_text += f'\nPNG mentve: {result["png"]}'
+        else:
+            saved_text += f'\nPNG nem készült: {result["image_error"]}'
+        self.saved_var.set(saved_text)
         self.status_text.set("Mérés kész.")
         self.measure_button.configure(state="normal")
         self.new_button.configure(state="normal")
@@ -388,7 +406,9 @@ class AnalyzerGUI(tk.Tk):
 
         # Kezdőbarát üzenetek: a technikai részleteket nem tesszük az arcába.
         friendly = msg
-        if "nem különül el" in msg:
+        if "Széles pár:" in msg or "nem detektálható helyi fényességcsúcs" in msg:
+            friendly = msg
+        elif "nem különül el" in msg:
             friendly = "A két komponens ezen a képen nem különül el megbízhatóan."
         elif "nincs önállóan detektálható" in msg:
             friendly = "Az egyik komponens ezen a képen nem detektálható önálló csillagként."

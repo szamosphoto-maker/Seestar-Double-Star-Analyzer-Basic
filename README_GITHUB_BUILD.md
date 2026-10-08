@@ -1,45 +1,31 @@
-# Seestar Double Star Analyzer Basic — Windows EXE build
+# DuoStar Basic — GitHub Actions Windows EXE build
 
-Ez a csomag GitHub Actions segítségével készíti el a Windows EXE-t.
-A saját gépeden nem kell PyInstallert telepíteni és nem kell parancssorban fordítani.
+Ez a csomag a DuoStar Basic adaptív PSF-illesztéssel és az automatikus **5′ × 5′ annotált PNG-mentéssel** frissített forrásait tartalmazza.
 
-## Feltöltendő fájlok
+## Feltöltendő fájlok (azonos elérési útvonalon)
 
-A ZIP teljes tartalmát töltsd fel egy GitHub repository-ba, beleértve:
+- `Seestar_Double_Star_Analyzer_Basic_GUI.py` (a meglévő GUI)
+- `photoanalyzer_basic.py` (az STF 2528 AC-n kipróbált adaptív mérőmotor)
+- `duostar_annotation.py` (automatikus, 5′-es PNG-készítés)
+- `Seestar_wds.csv` (külső WDS-katalógus)
+- `.github/workflows/build-windows.yml` (frissített GitHub Actions workflow)
 
-- `Seestar_Double_Star_Analyzer_Basic_GUI.py`
-- `photoanalyzer_basic.py`
-- `Seestar_wds.csv`
-- `.github/workflows/build-windows.yml`
+**Fontos:** a `.github/workflows/` könyvtárstruktúrát pontosan meg kell tartani. A GitHub repository gyökerébe töltendők fel a három `.py` fájl és a CSV.
 
-A `.github` mappa fontos.
+## Build a GitHubon
 
-## Build indítása
+1. A repository-ban töltsd fel / cseréld le az előző fájlokat a fenti elérési utakon (commit).
+2. **Actions** → **Build Windows EXE** → **Run workflow** → **Run workflow**.
+3. Várd meg a zöld pipát. Hiba esetén a sikertelen lépés naplója megmutatja az okot.
+4. A futás **Artifacts** részében töltsd le a `Seestar-Double-Star-Analyzer-Basic-Windows` ZIP-et.
+5. A ZIP-ből az EXE-t és a `Seestar_wds.csv`-t tartsd együtt egy mappában.
+6. Kipróbálás: ugyanazon a Seestar FITS-képen mérd meg az **STF 2528 AB** és **STF 2528 AC** párt. Ellenőrizd, hogy a TXT és az 5′-es annotált PNG is elkészül-e.
 
-1. Nyisd meg a repository-t GitHubon.
-2. Kattints felül az **Actions** fülre.
-3. Bal oldalon válaszd: **Build Windows EXE**.
-4. Kattints: **Run workflow**.
-5. Ismét: **Run workflow**.
-6. Várd meg, amíg a build zöld pipát kap.
-7. Nyisd meg az elkészült workflow futást.
-8. Legalul az **Artifacts** résznél töltsd le:
-   `Seestar-Double-Star-Analyzer-Basic-Windows`
+## Mi változott a buildben?
 
-A letöltött ZIP-ben ez a két fájl lesz:
+- `matplotlib==3.9.2` települ és bekerül az EXE-be.
+- A dinamikusan importált `duostar_annotation` modult explicit hozzáadjuk (`--hidden-import`).
+- A PyInstaller parancs PowerShell-kompatibilis (egyetlen parancssor).
+- A Windowsos build automatikusan ellenőrzi a Python-források szintaxisát és az importokat.
 
-- `Seestar Double Star Analyzer Basic.exe`
-- `Seestar_wds.csv`
-
-Ezt a két fájlt kell együtt tartani.
-
-A végfelhasználónak:
-- nem kell Python,
-- nem kell PyInstaller,
-- nem kell BAT fájl,
-- nem kell parancssor,
-- csak az EXE-re kell duplán kattintani.
-
-## Megjegyzés
-
-Az EXE digitálisan nincs aláírva, ezért a Windows SmartScreen első indításkor figyelmeztethet.
+**Az EXE itt nem készült el.** Ezt a GitHub Actions Windows runner fogja előállítani. A végfelhasználónak továbbra sem kell Python vagy PyInstaller; a Seestar WDS CSV továbbra is az EXE mellett marad. Az EXE nincs digitálisan aláírva, ezért a SmartScreen figyelmeztethet.
