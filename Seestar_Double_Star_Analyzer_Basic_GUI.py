@@ -172,6 +172,8 @@ class AnalyzerGUI(tk.Tk):
             ("WDS", "WDS"),
             ("PA", "PA"),
             ("Separation", "Szeparáció"),
+            ("Mag1", "Mag1 (WDS)"),
+            ("Mag2", "Mag2 (számított)"),
             ("Delta mag", "Δmag"),
             ("Quality", "Minőség"),
         ]
@@ -348,7 +350,7 @@ class AnalyzerGUI(tk.Tk):
         )
 
         wds_dmag = abs(float(row.mag_b) - float(row.mag_a))
-        dmag_diff = abs(float(dmag) - wds_dmag)
+        dmag_diff = abs(abs(float(dmag)) - wds_dmag)
         if dmag_diff > engine.MAX_WDS_DMAG_DIFFERENCE:
             raise ValueError(
                 "A detektált társ fényessége nem egyezik eléggé a WDS-adattal."
@@ -376,6 +378,8 @@ class AnalyzerGUI(tk.Tk):
             "pa": pa,
             "rho": rho,
             "dmag": abs(float(dmag)),
+            "mag1": float(row.mag_a),
+            "mag2": float(row.mag_a) + float(dmag),
             "quality": "GOOD",
             "saved": out,
             "png": png,
@@ -387,6 +391,8 @@ class AnalyzerGUI(tk.Tk):
         self.result_vars["WDS"].set(result["wds"])
         self.result_vars["PA"].set(f'{result["pa"]:.2f}°')
         self.result_vars["Separation"].set(f'{result["rho"]:.2f}"')
+        self.result_vars["Mag1"].set(f'{result["mag1"]:.2f} mag')
+        self.result_vars["Mag2"].set(f'{result["mag2"]:.2f} mag')
         self.result_vars["Delta mag"].set(f'{result["dmag"]:.2f} mag')
         self.result_vars["Quality"].set(result["quality"])
         saved_text = f'TXT mentve: {result["saved"]}'

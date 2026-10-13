@@ -673,7 +673,7 @@ def fit_single_star_centroid(
     return x, y, amp
 
 
-def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, label):
+def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, label, search_radius=3.0):
     """A wide-mode component must have a local, significant peak near WDS position.
 
     Use DAO when possible; if saturated/weak sources are missed, use a tightly
@@ -685,16 +685,16 @@ def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, lab
     expected_x = float(np.asarray(expected_x).item())
     expected_y = float(np.asarray(expected_y).item())
     ny, nx = data.shape
-    radius = 3.0  # identical to the PSF centroid's MAX_POSITION_SHIFT_PIX
+    radius = float(search_radius)  # WDS-eltérés megengedett keresési sugara
     cx, cy = int(round(expected_x)), int(round(expected_y))
-    margin = 11
+    margin = max(11, int(math.ceil(radius + 9.0)))
     if cx - margin < 0 or cy - margin < 0 or cx + margin >= nx or cy + margin >= ny:
         raise ValueError(f"{label}: nincs elég képfelület a csillag helyi vizsgálatához.")
 
     yy, xx = np.mgrid[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
     tile = data[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
     rad = np.hypot(xx - expected_x, yy - expected_y)
-    sky = tile[(rad >= 7.0) & (rad <= 11.0) & np.isfinite(tile)]
+    sky = tile[(rad >= radius + 4.0) & (rad <= radius + 8.0) & np.isfinite(tile)]
     if sky.size < 25:
         raise ValueError(f"{label}: nem mérhető a lokális háttér.")
     bg = float(np.median(sky))
@@ -745,11 +745,17 @@ def measure_wide_pair(
     if not all(np.isfinite([x_a_exp, y_a_exp, x_b_exp, y_b_exp])):
         raise ValueError("A várható komponenspozíció nem alakítható pixelkoordinátává.")
 
+    # Régi WDS-adatoknál a társ pozíciója több pixellel is elmozdulhat.
+    # A nagyobb keresési sugarat a PA/szeparáció ellenőrzése ellensúlyozza.
+    expected_sep_pix = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
+    companion_search = min(12.0, max(3.0, 0.25 * expected_sep_pix))
+    primary_search = 6.0  # az A komponens WDS-koordinátája is lehet elavult
+
     dao_ax, dao_ay, method_a = locate_wide_component(
-        data, sources, x_a_exp, y_a_exp, fwhm_guess, 'A'
+        data, sources, x_a_exp, y_a_exp, fwhm_guess, 'A', search_radius=primary_search
     )
     dao_bx, dao_by, method_b = locate_wide_component(
-        data, sources, x_b_exp, y_b_exp, fwhm_guess, 'B/C'
+        data, sources, x_b_exp, y_b_exp, fwhm_guess, 'B/C', search_radius=companion_search
     )
     sep_detected = math.hypot(dao_ax - dao_bx, dao_ay - dao_by)
     sep_expected = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
@@ -771,15 +777,27 @@ def measure_wide_pair(
         )
     except Exception as exc:
         raise RuntimeError(f"Széles pár, társkomponens PSF-illesztés: {exc}") from exc
-    if (math.hypot(x_a-x_a_exp, y_a-y_a_exp) > 3.0 or
-            math.hypot(x_b-x_b_exp, y_b-y_b_exp) > 3.0):
-        raise ValueError('Széles pár: az illesztett csillagpozíció eltér a WDS alapján várttól.')
+    offset_a = math.hypot(x_a-x_a_exp, y_a-y_a_exp)
+    offset_b = math.hypot(x_b-x_b_exp, y_b-y_b_exp)
+    primary_limit = primary_search + MAX_POSITION_SHIFT_PIX
+    print(f'Wide WDS offsets: A={offset_a:.2f} px (limit={primary_limit:.2f}); '
+          f'B/C={offset_b:.2f} px (limit={companion_search + MAX_POSITION_SHIFT_PIX:.2f})')
+    if offset_a > primary_limit or offset_b > companion_search + MAX_POSITION_SHIFT_PIX:
+        failed = []
+        if offset_a > primary_limit:
+            failed.append(f'A: {offset_a:.2f} px (határ {primary_limit:.2f} px)')
+        if offset_b > companion_search + MAX_POSITION_SHIFT_PIX:
+            failed.append(f'B/C: {offset_b:.2f} px (határ {companion_search + MAX_POSITION_SHIFT_PIX:.2f} px)')
+        raise ValueError('Széles pár: WDS-pozíció ellenőrzés sikertelen: ' + '; '.join(failed))
 
     coord_a = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode="all")
     coord_b = pixel_to_skycoord(x_b, y_b, wcs, origin=0, mode="all")
 
     pa = float(coord_a.position_angle(coord_b).to_value(u.deg) % 360.0)
     rho = float(coord_a.separation(coord_b).to_value(u.arcsec))
+    pa_diff = abs((pa - row.pa_last + 180.0) % 360.0 - 180.0)
+    if pa_diff > 8.0:
+        raise ValueError(f'Széles pár: a PA eltérése túl nagy ({pa_diff:.2f}° > 8°); lehetséges téves azonosítás.')
     dmag = abs(float(-2.5 * math.log10(amp_b / amp_a)))
 
     # wide mode-ban nincs közös fit RMS; NaN-ként adjuk vissza
@@ -813,7 +831,7 @@ def aperture_delta_mag(
     - a háttérgyűrűt távolabb tesszük a csillagprofil szárnyaitól
 
     Visszatérés:
-    abs(delta_mag), flux_a, flux_b, aperture_radius
+    signed(delta_mag), flux_a, flux_b, aperture_radius
     """
     sep_pix = math.hypot(x_b - x_a, y_b - y_a)
     if not np.isfinite(sep_pix) or sep_pix <= 1.0:
@@ -886,7 +904,7 @@ def aperture_delta_mag(
             f"Nem pozitív apertúrás fluxus (A={flux_a:.3f}, B={flux_b:.3f})."
         )
 
-    dmag = abs(float(-2.5 * math.log10(flux_b / flux_a)))
+    dmag = float(-2.5 * math.log10(flux_b / flux_a))
     return dmag, flux_a, flux_b, float(r_ap)
 
 
@@ -910,6 +928,8 @@ def write_result_txt(fit_path: Path, row: WDSRow, obs_time: str,
         f"Date: {obs_time} UTC\n\n"
         f"PA: {pa:.2f} deg\n"
         f"Separation: {rho:.2f} arcsec\n"
+        f"Mag1 (WDS): {row.mag_a:.2f} mag\n"
+        f"Mag2 (calculated): {row.mag_a + dmag:.2f} mag\n"
         f"Delta mag: {abs(dmag):.2f} mag\n\n"
         f"Quality: GOOD\n",
         encoding="utf-8",
@@ -1015,7 +1035,7 @@ def main() -> int:
             # ne fogadjunk el egy véletlen, jóval halványabb/fényesebb csillagot
             # pusztán azért, mert a várt pozíció közelében van.
             wds_dmag = abs(float(row.mag_b) - float(row.mag_a))
-            dmag_diff = abs(float(dmag) - wds_dmag)
+            dmag_diff = abs(abs(float(dmag)) - wds_dmag)
 
             print(
                 f"Fotometria: PSF Δmag={dmag_psf:.2f}, "
@@ -1042,7 +1062,9 @@ def main() -> int:
             print(f"WDS:         {row.wds_id}")
             print(f"PA:          {pa:.2f} deg")
             print(f"Separation:  {rho:.2f} arcsec")
-            print(f"Delta mag:   {dmag:.2f} mag")
+            print(f"Mag1 (WDS): {row.mag_a:.2f} mag")
+            print(f"Mag2 (calc): {row.mag_a + dmag:.2f} mag")
+            print(f"Delta mag:   {abs(dmag):.2f} mag")
             print("Quality:     GOOD")
             print(f"\nTXT mentve: {out}")
             # Optional image export: a failure here cannot invalidate a valid measurement.
