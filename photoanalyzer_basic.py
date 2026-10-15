@@ -41,12 +41,13 @@ from photutils.detection import DAOStarFinder
 
 
 APP_NAME = "Seestar Double Star Analyzer Basic"
-VERSION = "1.1a"
+VERSION = "1.1e"
+LAST_WIDE_DIAGNOSTICS = None
+LAST_WING_TESTS = None
 
 MIN_BASIC_SEPARATION_ARCSEC = 10.0
 MAX_BASIC_MAG = 14.0
 WIDE_PAIR_THRESHOLD_ARCSEC = 30.0
-MAX_WDS_DMAG_DIFFERENCE = 3.0
 
 # EREDETI PHOTOANALYZER MÉRÉSI KONSTANSOK
 MIN_MEASURABLE_SEPARATION_ARCSEC = 1.0
@@ -108,7 +109,7 @@ def load_basic_catalog(path: Path) -> list[WDSRow]:
         }
         missing = required - set(reader.fieldnames or [])
         if missing:
-            raise ValueError("Hiányzó katalógusoszlop(ok): " + ", ".join(sorted(missing)))
+            raise ValueError("Missing catalog column(s): " + ", ".join(sorted(missing)))
 
         for rec in reader:
             pa = safe_float(rec.get("PA_Last"))
@@ -156,12 +157,12 @@ def find_matches(rows: list[WDSRow], query: str) -> list[WDSRow]:
 
 def choose_match(matches: list[WDSRow]) -> WDSRow:
     if not matches:
-        raise LookupError("Nincs ilyen kettős a Seestar katalógusban.")
+        raise LookupError("This double star is not in the Seestar catalog.")
 
     if len(matches) == 1:
         return matches[0]
 
-    print("\nTöbb találat van. Válassz sorszámot:")
+    print("\nMultiple matches found. Select a number:")
     for i, row in enumerate(matches, 1):
         comp = row.comp or "-"
         print(
@@ -171,12 +172,12 @@ def choose_match(matches: list[WDSRow]) -> WDSRow:
         )
     while True:
         try:
-            n = int(input("Sorszám: ").strip())
+            n = int(input("Number: ").strip())
             if 1 <= n <= len(matches):
                 return matches[n-1]
         except Exception:
             pass
-        print("Érvénytelen választás.")
+        print("Invalid selection.")
 
 
 def observation_time_text(header: fits.Header) -> str:
@@ -213,7 +214,7 @@ def normalize_image_data(data: np.ndarray) -> np.ndarray:
 
     arr = np.asarray(arr, dtype=float)
     if not np.any(np.isfinite(arr)):
-        raise ValueError("A FITS-kép nem tartalmaz véges pixelértékeket.")
+        raise ValueError("The FITS image contains no finite pixel values.")
 
     return arr
 
@@ -227,7 +228,7 @@ def estimate_fwhm_and_sources(data: np.ndarray) -> tuple[float, object]:
     """
     _, median, std = sigma_clipped_stats(data, sigma=3.0)
     if not np.isfinite(std) or std <= 0:
-        raise ValueError("Nem becsülhető a kép háttérzaja.")
+        raise ValueError("Unable to estimate the image background noise.")
 
     best_sources = None
     best_count = -1
@@ -248,7 +249,7 @@ def estimate_fwhm_and_sources(data: np.ndarray) -> tuple[float, object]:
             best_fwhm = fwhm
 
     if best_sources is None or len(best_sources) == 0:
-        raise RuntimeError("DAOStarFinder nem talált használható csillagokat.")
+        raise RuntimeError("DAOStarFinder found no usable stars.")
 
     # A sharpness alapján csak ésszerű forrásokat tartunk meg.
     if "sharpness" in best_sources.colnames:
@@ -329,12 +330,12 @@ def require_two_independent_sources(
 
     if dao_a is None:
         raise ValueError(
-            "Az A komponens helyén nincs önállóan detektálható csillagforrás."
+            "No independently detectable stellar source at the first component position."
         )
 
     if dao_b is None:
         raise ValueError(
-            "A B komponens helyén nincs önállóan detektálható csillagforrás."
+            "No independently detectable stellar source at the second component position."
         )
 
     measured_sep_pix = math.hypot(
@@ -345,7 +346,7 @@ def require_two_independent_sources(
     min_independent_sep = max(1.5, 0.75 * float(fwhm_guess))
     if measured_sep_pix < min_independent_sep:
         raise ValueError(
-            "A két komponens nem különül el önálló csillagforrásként a stacked FIT-en."
+            "The two components cannot be resolved as separate stars in the stacked FITS image."
         )
 
     expected_sep_pix = math.hypot(
@@ -357,8 +358,8 @@ def require_two_independent_sources(
         ratio = measured_sep_pix / expected_sep_pix
         if not (0.70 <= ratio <= 1.30):
             raise ValueError(
-                "A detektált két csillag távolsága túlzottan eltér "
-                "a WDS alapján várt komponens-távolságtól."
+                "The separation of the detected stars differs too much "
+                "from the WDS reference separation."
             )
 
     return dao_a, dao_b
@@ -380,7 +381,7 @@ def fit_pair_on_frame(
     raA, decA, raB, decB
     """
     if row.sep_last < MIN_MEASURABLE_SEPARATION_ARCSEC:
-        raise ValueError("A pár az 1 ívmásodperces mérési határ alatt van.")
+        raise ValueError("The pair is below the 1-arcsecond measurement limit.")
 
     expected_a = row.coord
     expected_b = expected_a.directional_offset_by(
@@ -392,7 +393,7 @@ def fit_pair_on_frame(
     x_b_exp, y_b_exp = skycoord_to_pixel(expected_b, wcs, origin=0, mode="all")
 
     if not all(np.isfinite([x_a_exp, y_a_exp, x_b_exp, y_b_exp])):
-        raise ValueError("A várható komponenspozíció nem alakítható pixelkoordinátává.")
+        raise ValueError("Cannot transform the expected component position into pixel coordinates.")
 
     # Basic módban csak akkor mérünk, ha mindkét komponens
     # külön, önálló csillagforrásként ténylegesen detektálható.
@@ -434,7 +435,7 @@ def fit_pair_on_frame(
         or y_max_raw > ny
     ):
         raise ValueError(
-            "A pár vagy a teljes PSF-kivágás a képszélen kívülre esik."
+            "The pair or full PSF cutout extends beyond the image boundary."
         )
 
     x_min = x_min_raw
@@ -444,7 +445,7 @@ def fit_pair_on_frame(
 
     cut = data[y_min:y_max, x_min:x_max]
     if cut.shape[0] < 9 or cut.shape[1] < 9:
-        raise ValueError("A pár túl közel van a képszélhez.")
+        raise ValueError("The pair is too close to the image edge.")
 
     _, background, noise = sigma_clipped_stats(cut, sigma=3.0)
     if not np.isfinite(noise) or noise <= 0:
@@ -536,7 +537,7 @@ def fit_pair_on_frame(
         amp_a, amp_b = amp_b, amp_a
 
     if amp_a <= 0 or amp_b <= 0:
-        raise ValueError("Nem pozitív illesztett komponensfluxus.")
+        raise ValueError("Non-positive fitted component flux.")
 
     coord_a = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode="all")
     coord_b = pixel_to_skycoord(x_b, y_b, wcs, origin=0, mode="all")
@@ -553,7 +554,7 @@ def fit_pair_on_frame(
 
     if rho < MIN_MEASURABLE_SEPARATION_ARCSEC:
         raise ValueError(
-            f"Az illesztett szeparáció {rho:.3f}\", a {MIN_MEASURABLE_SEPARATION_ARCSEC:.1f}\"-es határ alatt van."
+            f"The fitted separation ({rho:.3f}\") is below the {MIN_MEASURABLE_SEPARATION_ARCSEC:.1f}\" measurement limit."
         )
 
     return (
@@ -602,7 +603,7 @@ def fit_single_star_centroid(
     xmin, xmax = int(math.floor(x0-half)), int(math.ceil(x0+half+1))
     ymin, ymax = int(math.floor(y0-half)), int(math.ceil(y0+half+1))
     if xmin < 0 or ymin < 0 or xmax > nx or ymax > ny:
-        raise ValueError('A csillag túl közel van a képszélhez.')
+        raise ValueError('The star is too close to the image edge.')
     cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
     yy, xx = np.mgrid[ymin:ymax, xmin:xmax]
     radius = np.hypot(xx-x0, yy-y0)
@@ -628,7 +629,7 @@ def fit_single_star_centroid(
                 usable &= np.hypot(xx-sx, yy-sy) > exclusion
 
     if np.count_nonzero(usable) < 25:
-        raise ValueError('Nincs elegendő ép pixel az adaptív PSF-illesztéshez.')
+        raise ValueError('Insufficient valid pixels for adaptive PSF fitting.')
     # Estimate background from *unmasked* distant pixels.
     sky = cut[usable & (radius >= 1.8*fwhm)]
     if sky.size < 12:
@@ -661,16 +662,179 @@ def fit_single_star_centroid(
         raise RuntimeError(f'Adaptív PSF-illesztés nem konvergált: {result.message}')
     x, y, amp, sig, bg = (float(v) for v in result.x)
     if amp <= 0 or not np.all(np.isfinite(result.x)):
-        raise ValueError('Nem megbízható PSF-paraméterek.')
+        raise ValueError('Unreliable PSF parameters.')
     if math.hypot(x-x0, y-y0) > MAX_POSITION_SHIFT_PIX:
-        raise ValueError('Az illesztett centroid túl távol került a detektált csillagtól.')
+        raise ValueError('The fitted centroid moved too far from the detected star.')
     # Reject fits stuck on the allowed sigma or centroid limits.
     if sig >= max(8.0, 2*fwhm)*0.99 or sig <= 0.46:
-        raise ValueError('Az illesztett PSF szélessége határértéken van.')
+        raise ValueError('The fitted PSF width reached a limit.')
     print(f'Adaptive PSF: centroid=({x:.3f},{y:.3f}), '
           f'pixels={usable.sum()}, saturation={saturated}, '
           f'nearby_DAO={len(neighbours)}, nfev={result.nfev}')
     return x, y, amp
+
+
+
+
+def fit_saturated_star_wings(
+    data: np.ndarray,
+    x0: float,
+    y0: float,
+    fwhm_guess: float,
+    nearby_sources=None,
+) -> tuple[float, float, float]:
+    """Tartalék centroid a levágott csillagprofil *nem telített szárnyaiból*.
+
+    Csak akkor alkalmazható, ha a normál illesztés meghiúsult ÉS a csillag
+    magjában valóban vannak telített pixelek. A koordinátákat ellenőrzi;
+    a fluxust továbbra is az eredeti apertúrás fotometria számítja.
+    """
+    x0, y0 = float(x0), float(y0)
+    fwhm = max(1.5, float(fwhm_guess))
+    ny, nx = data.shape
+    half = max(10, int(math.ceil(3.5 * fwhm)))
+    xmin, xmax = int(math.floor(x0-half)), int(math.ceil(x0+half+1))
+    ymin, ymax = int(math.floor(y0-half)), int(math.ceil(y0+half+1))
+    if xmin < 0 or ymin < 0 or xmax > nx or ymax > ny:
+        raise ValueError('Saturated PSF: star too close to the image edge.')
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    yy, xx = np.mgrid[ymin:ymax, xmin:xmax]
+    radius = np.hypot(xx-x0, yy-y0)
+    saturated_core = (radius <= max(3.0, 1.5*fwhm)) & (cut >= 65000)
+    if np.count_nonzero(saturated_core) == 0:
+        raise ValueError('Saturated PSF fallback unavailable: no saturated core.')
+
+    usable = np.isfinite(cut) & (cut < 65000) & (radius <= 3.0*fwhm)
+    if nearby_sources is not None and len(nearby_sources):
+        xs = np.asarray(nearby_sources['xcentroid'], dtype=float)
+        ys = np.asarray(nearby_sources['ycentroid'], dtype=float)
+        for sx, sy in zip(xs, ys):
+            dist = math.hypot(float(sx)-x0, float(sy)-y0)
+            if 2.0 <= dist < half+fwhm:
+                usable &= np.hypot(xx-sx, yy-sy) > max(1.8, 0.85*fwhm)
+    if np.count_nonzero(usable) < 35:
+        raise ValueError('Saturated PSF: insufficient usable wing pixels.')
+
+    # A szárnyak több irányból kell, hogy megmaradjanak, különben a
+    # szomszédos csillag fénye felé eltolódhatna a centroid.
+    ang = (np.arctan2(yy-y0, xx-x0) + 2*np.pi) % (2*np.pi)
+    sectors = set(np.floor(ang[usable] / (np.pi/4)).astype(int).tolist())
+    if len(sectors) < 5:
+        raise ValueError('Saturated PSF: usable profile does not cover enough directions.')
+
+    bg_pixels = cut[usable & (radius >= 2.2*fwhm)]
+    if bg_pixels.size < 15:
+        bg_pixels = cut[usable & (radius >= 1.7*fwhm)]
+    if bg_pixels.size < 15:
+        raise ValueError('Saturated PSF: background cannot be estimated.')
+    bg0 = float(np.median(bg_pixels))
+    noise = max(1.4826*float(np.median(np.abs(bg_pixels-bg0))), 1.0)
+    vx = xx[usable].astype(float)
+    vy = yy[usable].astype(float)
+    vals = cut[usable]
+    sigma0 = max(0.7, fwhm/2.35482)
+    amplitude0 = max(float(np.max(vals)-bg0), noise*6.0)
+    lower = np.array([x0-2.0, y0-2.0, 0.0, 0.55, bg0-5*noise])
+    upper = np.array([x0+2.0, y0+2.0,
+                      max(amplitude0*30, 70000.0),
+                      max(7.0, 2.0*fwhm), bg0+5*noise])
+
+    def residuals(p):
+        x, y, amplitude, sigma, bg = p
+        model = bg + amplitude*np.exp(-0.5*((vx-x)**2+(vy-y)**2)/sigma**2)
+        return (model-vals)/noise
+
+    candidates = []
+    for sigma_scale in (0.8, 1.0, 1.3, 1.7):
+        p0 = np.array([x0, y0, max(amplitude0*1.5, 65000-bg0),
+                       sigma0*sigma_scale, bg0])
+        p0 = np.maximum(lower+1e-5, np.minimum(upper-1e-5, p0))
+        try:
+            result = least_squares(residuals, p0, bounds=(lower, upper),
+                                   loss='soft_l1', f_scale=2.0,
+                                   max_nfev=5000)
+        except (ValueError, FloatingPointError):
+            continue
+        if not result.success or not np.all(np.isfinite(result.x)):
+            continue
+        x, y, amp, sig, bg = result.x
+        if amp <= 0 or sig < 0.6 or sig >= upper[3]*0.98:
+            continue
+        if math.hypot(x-x0, y-y0) > 1.8:
+            continue
+        if np.any(np.isclose(result.x[:2], lower[:2], atol=0.03)) or \
+           np.any(np.isclose(result.x[:2], upper[:2], atol=0.03)):
+            continue
+        error = float(np.median(np.abs(residuals(result.x))))
+        if np.isfinite(error):
+            candidates.append((error, float(x), float(y), float(amp)))
+
+    if not candidates:
+        raise ValueError('Saturated PSF: wing fit is unstable.')
+    candidates.sort()
+    error, x, y, amp = candidates[0]
+    if error > 12.0:
+        raise ValueError(f'Saturated PSF: excessive wing residual ({error:.1f} sigma).')
+    print(f'Telített PSF-tartalék: centroid=({x:.3f},{y:.3f}), '
+          f'használható pixelek={int(np.count_nonzero(usable))}, '
+          f'illesztési maradék={error:.2f} sigma')
+    return x, y, amp
+
+
+def independent_wing_centroid(data, x0, y0, fwhm_guess, nearby_sources=None):
+    """Független, konzervatív szárny-centroid teszt TELÍTETT csillagokra.
+
+    Nem módosítja a mérést: két eltérő belső maszkkal becsli a súlyozott
+    középpontot, és elutasítja az instabil/aszimmetrikus eredményt.
+    """
+    x0, y0 = float(x0), float(y0)
+    fwhm = max(1.5, float(fwhm_guess))
+    ny, nx = data.shape
+    half = int(math.ceil(3.5 * fwhm))
+    xmin, xmax = int(math.floor(x0-half)), int(math.ceil(x0+half+1))
+    ymin, ymax = int(math.floor(y0-half)), int(math.ceil(y0+half+1))
+    if xmin < 0 or ymin < 0 or xmax > nx or ymax > ny:
+        raise ValueError('Wing centroid: image edge.')
+    cut = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    yy, xx = np.mgrid[ymin:ymax, xmin:xmax]
+    rr = np.hypot(xx-x0, yy-y0)
+    sat_count = int(np.count_nonzero((rr < 1.6*fwhm) & (cut >= 65000)))
+    if sat_count == 0:
+        raise ValueError('Wing centroid: no saturated core.')
+    sky = cut[(rr >= 2.8*fwhm) & (rr <= 3.4*fwhm) & np.isfinite(cut)]
+    if sky.size < 20:
+        raise ValueError('Wing centroid: insufficient background pixels.')
+    bg = float(np.median(sky))
+    noise = max(1.0, 1.4826 * float(np.median(np.abs(sky-bg))))
+    exclusion = np.zeros_like(cut, dtype=bool)
+    if nearby_sources is not None and len(nearby_sources):
+        for sx, sy in zip(nearby_sources['xcentroid'], nearby_sources['ycentroid']):
+            d = math.hypot(float(sx)-x0, float(sy)-y0)
+            if 2.0 <= d < 3.5*fwhm:
+                exclusion |= np.hypot(xx-float(sx), yy-float(sy)) < max(1.8, .85*fwhm)
+
+    estimates = []
+    for inner in (0.65*fwhm, 0.9*fwhm):
+        mask = (np.isfinite(cut) & (cut < 65000) & ~exclusion
+                & (rr >= inner) & (rr <= 2.2*fwhm))
+        weights = np.maximum(cut-bg-2.0*noise, 0.0)
+        mask &= weights > 0
+        if np.count_nonzero(mask) < 25 or weights[mask].sum() <= 0:
+            raise ValueError('Wing centroid: insufficient usable wing pixels.')
+        angles = (np.arctan2(yy[mask]-y0, xx[mask]-x0) + 2*np.pi) % (2*np.pi)
+        if len(np.unique(np.floor(angles / (np.pi/4)).astype(int))) < 6:
+            raise ValueError('Wing centroid: asymmetric profile.')
+        cx = float(np.average(xx[mask], weights=weights[mask]))
+        cy = float(np.average(yy[mask], weights=weights[mask]))
+        if math.hypot(cx-x0, cy-y0) > 1.5:
+            raise ValueError('Wing centroid: excessive displacement.')
+        estimates.append((cx, cy))
+    stability = math.hypot(estimates[0][0]-estimates[1][0],
+                           estimates[0][1]-estimates[1][1])
+    if stability > 0.35:
+        raise ValueError(f'Szárnycentroid: instabil két maszk ({stability:.3f} px).')
+    return (0.5*(estimates[0][0]+estimates[1][0]),
+            0.5*(estimates[0][1]+estimates[1][1]), stability, sat_count)
 
 
 def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, label, search_radius=3.0):
@@ -678,7 +842,7 @@ def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, lab
 
     Use DAO when possible; if saturated/weak sources are missed, use a tightly
     bounded peak search. This never substitutes the other component and does
-    not bypass subsequent PSF fitting or WDS/photometric quality checks.
+    not bypass subsequent PSF fitting or astrometric quality checks.
     """
     # Astropy WCS may return a zero-dimensional ndarray rather than a Python float.
     # Convert scalar coordinates before round(), scalar masks and distance checks.
@@ -689,20 +853,20 @@ def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, lab
     cx, cy = int(round(expected_x)), int(round(expected_y))
     margin = max(11, int(math.ceil(radius + 9.0)))
     if cx - margin < 0 or cy - margin < 0 or cx + margin >= nx or cy + margin >= ny:
-        raise ValueError(f"{label}: nincs elég képfelület a csillag helyi vizsgálatához.")
+        raise ValueError(f"{label}: insufficient image area for local star inspection.")
 
     yy, xx = np.mgrid[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
     tile = data[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
     rad = np.hypot(xx - expected_x, yy - expected_y)
     sky = tile[(rad >= radius + 4.0) & (rad <= radius + 8.0) & np.isfinite(tile)]
     if sky.size < 25:
-        raise ValueError(f"{label}: nem mérhető a lokális háttér.")
+        raise ValueError(f"{label}: local background cannot be estimated.")
     bg = float(np.median(sky))
     mad = float(np.median(np.abs(sky-bg)))
     noise = max(1.4826 * mad, float(np.std(sky)), 1.0)
     local_mask = (rad <= radius) & np.isfinite(tile)
     if not np.any(local_mask):
-        raise ValueError(f"{label}: nincs érvényes pixel a várt pozícióban.")
+        raise ValueError(f"{label}: no valid pixels at the expected position.")
     peak = float(np.max(tile[local_mask]))
     snr = (peak-bg)/noise
     if snr < 6.0:
@@ -743,7 +907,7 @@ def measure_wide_pair(
     x_b_exp, y_b_exp = skycoord_to_pixel(expected_b, wcs, origin=0, mode="all")
 
     if not all(np.isfinite([x_a_exp, y_a_exp, x_b_exp, y_b_exp])):
-        raise ValueError("A várható komponenspozíció nem alakítható pixelkoordinátává.")
+        raise ValueError("Cannot transform the expected component position into pixel coordinates.")
 
     # Régi WDS-adatoknál a társ pozíciója több pixellel is elmozdulhat.
     # A nagyobb keresési sugarat a PA/szeparáció ellenőrzése ellensúlyozza.
@@ -760,23 +924,81 @@ def measure_wide_pair(
     sep_detected = math.hypot(dao_ax - dao_bx, dao_ay - dao_by)
     sep_expected = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
     if sep_detected < max(2.0, 0.7 * sep_expected):
-        raise ValueError('Széles pár: ugyanaz a forrás vagy hibás komponens-azonosítás.')
+        raise ValueError('Wide pair: same source detected twice or incorrect component identification.')
 
     print(f'Wide identification: A={method_a} ({dao_ax:.2f}, {dao_ay:.2f}); '
           f'B/C={method_b} ({dao_bx:.2f}, {dao_by:.2f})')
     # Azonosítsuk pontosan, melyik komponens illesztése hibázik.
+    psf_a = "normal"
+    psf_b = "normal"
     try:
         x_a, y_a, amp_a = fit_single_star_centroid(
             data, dao_ax, dao_ay, fwhm_guess, nearby_sources=sources
         )
     except Exception as exc:
-        raise RuntimeError(f"Széles pár, A komponens PSF-illesztés: {exc}") from exc
+        psf_a = 'saturated fallback'
+        print(f'First component: standard PSF fit failed ({exc}); trying saturated-star fallback.')
+        try:
+            x_a, y_a, amp_a = fit_saturated_star_wings(
+                data, dao_ax, dao_ay, fwhm_guess, nearby_sources=sources
+            )
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"Wide pair, first component PSF fit: {exc}; "
+                f"telített tartalék: {fallback_exc}"
+            ) from fallback_exc
     try:
         x_b, y_b, amp_b = fit_single_star_centroid(
             data, dao_bx, dao_by, fwhm_guess, nearby_sources=sources
         )
     except Exception as exc:
-        raise RuntimeError(f"Széles pár, társkomponens PSF-illesztés: {exc}") from exc
+        psf_b = 'saturated fallback'
+        print(f'Second component: standard PSF fit failed ({exc}); trying saturated-star fallback.')
+        try:
+            x_b, y_b, amp_b = fit_saturated_star_wings(
+                data, dao_bx, dao_by, fwhm_guess, nearby_sources=sources
+            )
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"Wide pair, second component PSF fit: {exc}; "
+                f"telített tartalék: {fallback_exc}"
+            ) from fallback_exc
+    # Független szárny-centroidok csak összehasonlításra. A mért PA/rho
+    # változatlanul a v1.1c illesztett koordinátákból számolódik.
+    wing_tests = {}
+    for label, dx, dy, fx, fy in (
+        ('A', dao_ax, dao_ay, x_a, y_a),
+        ('B', dao_bx, dao_by, x_b, y_b),
+    ):
+        try:
+            wx, wy, stability, sat_count = independent_wing_centroid(
+                data, dx, dy, fwhm_guess, nearby_sources=sources)
+            wing_tests[label] = (wx, wy, stability, sat_count, None)
+            print(f'{label}: wing centroid=({wx:.4f}, {wy:.4f}), '
+                  f'PSF difference={math.hypot(wx-fx,wy-fy):.4f} px, '
+                  f'stabilitás={stability:.4f} px')
+        except Exception as exc:
+            wing_tests[label] = (None, None, None, None, str(exc))
+            print(f'{label}: wing centroid unavailable: {exc}')
+    global LAST_WING_TESTS
+    LAST_WING_TESTS = wing_tests
+    # Diagnosztikai adatok: nincs hatásuk a mérési algoritmusra.
+    # A naplót csak a sikeres komponensillesztés után írjuk.
+    global LAST_WIDE_DIAGNOSTICS
+    diagnostics = {
+        "A": (x_a_exp, y_a_exp, dao_ax, dao_ay, x_a, y_a, method_a, psf_a),
+        "B": (x_b_exp, y_b_exp, dao_bx, dao_by, x_b, y_b, method_b, psf_b),
+    }
+    LAST_WIDE_DIAGNOSTICS = diagnostics
+    print("\n--- DUOSTAR CENTROID DIAGNOSTICS ---")
+    for label, (ex, ey, dx, dy, fx, fy, detection, fitter) in diagnostics.items():
+        print(f"{label}: WDS=({float(ex):.4f}, {float(ey):.4f}) "
+              f"detected=({dx:.4f}, {dy:.4f}) "
+              f"fitted=({fx:.4f}, {fy:.4f}) "
+              f"WDS offset={math.hypot(fx-ex,fy-ey):.4f}px "
+              f"detektált-fitted={math.hypot(fx-dx,fy-dy):.4f}px "
+              f"detection={detection} PSF={fitter}")
+    print("--- END OF DIAGNOSTICS ---\n")
     offset_a = math.hypot(x_a-x_a_exp, y_a-y_a_exp)
     offset_b = math.hypot(x_b-x_b_exp, y_b-y_b_exp)
     primary_limit = primary_search + MAX_POSITION_SHIFT_PIX
@@ -785,10 +1007,10 @@ def measure_wide_pair(
     if offset_a > primary_limit or offset_b > companion_search + MAX_POSITION_SHIFT_PIX:
         failed = []
         if offset_a > primary_limit:
-            failed.append(f'A: {offset_a:.2f} px (határ {primary_limit:.2f} px)')
+            failed.append(f'A: {offset_a:.2f} px (limit {primary_limit:.2f} px)')
         if offset_b > companion_search + MAX_POSITION_SHIFT_PIX:
-            failed.append(f'B/C: {offset_b:.2f} px (határ {companion_search + MAX_POSITION_SHIFT_PIX:.2f} px)')
-        raise ValueError('Széles pár: WDS-pozíció ellenőrzés sikertelen: ' + '; '.join(failed))
+            failed.append(f'B/C: {offset_b:.2f} px (limit {companion_search + MAX_POSITION_SHIFT_PIX:.2f} px)')
+        raise ValueError('Wide pair: WDS position check failed: ' + '; '.join(failed))
 
     coord_a = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode="all")
     coord_b = pixel_to_skycoord(x_b, y_b, wcs, origin=0, mode="all")
@@ -797,7 +1019,7 @@ def measure_wide_pair(
     rho = float(coord_a.separation(coord_b).to_value(u.arcsec))
     pa_diff = abs((pa - row.pa_last + 180.0) % 360.0 - 180.0)
     if pa_diff > 8.0:
-        raise ValueError(f'Széles pár: a PA eltérése túl nagy ({pa_diff:.2f}° > 8°); lehetséges téves azonosítás.')
+        raise ValueError(f'Wide pair: PA difference is too large ({pa_diff:.2f}° > 8°); possible misidentification.')
     dmag = abs(float(-2.5 * math.log10(amp_b / amp_a)))
 
     # wide mode-ban nincs közös fit RMS; NaN-ként adjuk vissza
@@ -835,7 +1057,7 @@ def aperture_delta_mag(
     """
     sep_pix = math.hypot(x_b - x_a, y_b - y_a)
     if not np.isfinite(sep_pix) or sep_pix <= 1.0:
-        raise ValueError("Apertúrás fotometriához túl kicsi komponens-távolság.")
+        raise ValueError("Component separation is too small for aperture photometry.")
 
     fwhm = max(float(fitted_fwhm), 1.0)
 
@@ -860,7 +1082,7 @@ def aperture_delta_mag(
         ymax = min(ny, int(math.ceil(y0 + margin + 1)))
 
         if xmax - xmin < 7 or ymax - ymin < 7:
-            raise ValueError("Nincs elég hely az apertúrás fotometriához.")
+            raise ValueError("Insufficient image area for aperture photometry.")
 
         yy, xx = np.mgrid[ymin:ymax, xmin:xmax]
         sub = data[ymin:ymax, xmin:xmax]
@@ -882,7 +1104,7 @@ def aperture_delta_mag(
         ann_vals = ann_vals[np.isfinite(ann_vals)]
 
         if len(aper_vals) < 8 or len(ann_vals) < 20:
-            raise ValueError("Nincs elég használható pixel az apertúrás fotometriához.")
+            raise ValueError("Insufficient usable pixels for aperture photometry.")
 
         # Robusztus háttér, AIJ-szerű sky annulus logikával.
         bg = float(np.median(ann_vals))
@@ -910,11 +1132,11 @@ def aperture_delta_mag(
 
 def ask_fit_path() -> Path:
     while True:
-        raw = input("Seestar stacked FIT útvonala: ").strip().strip('"')
+        raw = input("Seestar stacked FITS path: ").strip().strip('"')
         p = Path(raw)
         if p.is_file() and p.suffix.lower() in FITS_EXTENSIONS:
             return p
-        print("Nem található használható FIT/FITS fájl.")
+        print("No usable FIT/FITS file found.")
 
 
 def write_result_txt(fit_path: Path, row: WDSRow, obs_time: str,
@@ -938,51 +1160,53 @@ def write_result_txt(fit_path: Path, row: WDSRow, obs_time: str,
 
 
 def main() -> int:
+    global LAST_WIDE_DIAGNOSTICS, LAST_WING_TESTS
     print("=" * 68)
     print(f"{APP_NAME} v{VERSION}")
     print("=" * 68)
-    print("Basic mód: 1 stacked Seestar FIT + 1 megadott kettős")
+    print("Basic mode: 1 stacked Seestar FITS + 1 selected double star")
     print(
-        f'Ajánlott tartomány: sep >= {MIN_BASIC_SEPARATION_ARCSEC:.0f}", '
-        f'mindkét komponens <= {MAX_BASIC_MAG:.1f} mag'
+        f'Recommended range: sep >= {MIN_BASIC_SEPARATION_ARCSEC:.0f}", '
+        f'both components <= {MAX_BASIC_MAG:.1f} mag'
     )
-    print("Mérési motor: IsoTool PhotoAnalyzer v1.3")
-    print(f"Fényességi védelem: max. {MAX_WDS_DMAG_DIFFERENCE:.1f} mag eltérés a WDS Δmag-tól")
+    print("Measurement engine: IsoTool PhotoAnalyzer v1.3")
     print(
-        f'Módváltás: <= {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}" közös PSF-fit, '
-        f'> {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}" külön komponensmérés'
+        f'Mode selection: <= {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}" joint PSF fit, '
+        f'> {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}" independent component fitting'
     )
     print()
 
     try:
         catalog = load_basic_catalog(get_app_dir() / "Seestar_wds.csv")
-        print(f"Katalógus betöltve: {len(catalog)} sor")
+        print(f"Catalog loaded: {len(catalog)} entries")
     except Exception as exc:
         print("\nHIBA")
         print("-" * 40)
         print(str(exc))
-        input("\nEnter a kilépéshez...")
+        input("\nPress Enter to exit...")
         return 1
 
     while True:
         try:
             fit_path = ask_fit_path()
-            query = input("Kettős azonosító (pl. HJ 1362): ").strip()
+            query = input("Double star designation (e.g. HJ 1362): ").strip()
             row = choose_match(find_matches(catalog, query))
 
-            print("\nKiválasztott pár:")
+            print("\nSelected pair:")
             print(f"  {row.pair_name} | WDS {row.wds_id}")
             print(f'  WDS last: PA={row.pa_last:.0f}°, sep={row.sep_last:.1f}"')
             print(f"  Mag: {row.mag_a:.2f} / {row.mag_b:.2f}")
 
-            print("\nMérés folyamatban...")
+            print("\nMeasurement in progress...")
+            LAST_WIDE_DIAGNOSTICS = None
+            LAST_WING_TESTS = None
             header, data, wcs = read_header_and_data(fit_path)
             fwhm_guess, sources = estimate_fwhm_and_sources(data)
             print(f"DAO elődetektálás: {len(sources)} forrás, FWHM~{fwhm_guess:.1f} px")
 
             if row.sep_last > WIDE_PAIR_THRESHOLD_ARCSEC:
                 print(
-                    f"Széles pár mód: külön komponensmérés "
+                    f"Wide-pair mode: independent component fitting "
                     f'(WDS sep > {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}").'
                 )
                 (
@@ -999,7 +1223,7 @@ def main() -> int:
                 )
             else:
                 print(
-                    f"Közeli pár mód: közös kétkomponensű PSF-fit "
+                    f"Close-pair mode: joint two-component PSF fit "
                     f'(WDS sep <= {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}").'
                 )
                 (
@@ -1015,11 +1239,85 @@ def main() -> int:
                     fwhm_guess=fwhm_guess,
                 )
 
+            # Egyszerű, reprodukálható asztrometriai napló a FITS mellett.
+            # A mérés eredményét és a Quality minősítést nem módosítja.
+            diag_path = fit_path.with_name(
+                re.sub(r'[^A-Za-z0-9_+\-]+', '_', row.pair_name).strip('_')
+                + '_centroid_diagnostic.txt'
+            )
+            try:
+                expected_a = row.coord
+                expected_b = expected_a.directional_offset_by(
+                    position_angle=row.pa_last * u.deg,
+                    separation=row.sep_last * u.arcsec,
+                )
+                exa, eya = skycoord_to_pixel(expected_a, wcs, origin=0, mode='all')
+                exb, eyb = skycoord_to_pixel(expected_b, wcs, origin=0, mode='all')
+                lines = [f"DuoStar centroid diagnostics v{VERSION}",
+                         f"FITS: {fit_path.name}", f"Object: {row.pair_name}",
+                         f"WDS: {row.wds_id}",
+                         f"Mode: {'wide' if row.sep_last > WIDE_PAIR_THRESHOLD_ARCSEC else 'close'}",
+                         f"DAO FWHM guess: {fwhm_guess:.4f} px", ""]
+                for label, ex, ey, fx, fy, ra, dec in (
+                    ('A', exa, eya, x_a, y_a, ra_a, dec_a),
+                    ('B', exb, eyb, x_b, y_b, ra_b, dec_b),
+                ):
+                    lines.extend([
+                        f"{label}: expected_WDS_pixel = ({float(ex):.5f}, {float(ey):.5f})",
+                        f"{label}: fitted_pixel = ({float(fx):.5f}, {float(fy):.5f})",
+                        f"{label}: fitted_RA_Dec_deg = ({ra:.9f}, {dec:.9f})",
+                        f"{label}: WDS_offset_px = {math.hypot(fx-ex, fy-ey):.5f}",
+                    ])
+                if LAST_WIDE_DIAGNOSTICS is not None:
+                    lines.append("")
+                    for label, (ex, ey, dx, dy, fx, fy, det, psf) in LAST_WIDE_DIAGNOSTICS.items():
+                        lines.extend([
+                            f"{label}: detected_pixel = ({dx:.5f}, {dy:.5f})",
+                            f"{label}: detection_method = {det}",
+                            f"{label}: psf_method = {psf}",
+                            f"{label}: detected_to_fitted_px = {math.hypot(fx-dx,fy-dy):.5f}",
+                        ])
+                if LAST_WING_TESTS is not None:
+                    lines.append('')
+                    lines.append('INDEPENDENT WING CENTROID (diagnostic only, not used in PA/rho):')
+                    for label, (wx, wy, stability, sat_count, error) in LAST_WING_TESTS.items():
+                        if error is not None:
+                            lines.append(f'{label}: wing_status = rejected: {error}')
+                        else:
+                            fx, fy = (x_a, y_a) if label == 'A' else (x_b, y_b)
+                            lines.extend([
+                                f'{label}: wing_pixel = ({wx:.5f}, {wy:.5f})',
+                                f'{label}: wing_mask_stability_px = {stability:.5f}',
+                                f'{label}: saturated_core_pixel_count = {sat_count}',
+                                f'{label}: wing_to_psf_px = {math.hypot(wx-fx,wy-fy):.5f}',
+                            ])
+                    if all(LAST_WING_TESTS[k][4] is None for k in ('A','B')):
+                        wa, wb = LAST_WING_TESTS['A'], LAST_WING_TESTS['B']
+                        ca = pixel_to_skycoord(wa[0], wa[1], wcs, origin=0, mode='all')
+                        cb = pixel_to_skycoord(wb[0], wb[1], wcs, origin=0, mode='all')
+                        lines.extend([
+                            f'WING_ONLY_PA_deg = {float(ca.position_angle(cb).to_value(u.deg)%360):.5f}',
+                            f'WING_ONLY_Separation_arcsec = {float(ca.separation(cb).to_value(u.arcsec)):.5f}',
+                        ])
+                    elif LAST_WING_TESTS['B'][4] is None:
+                        wb = LAST_WING_TESTS['B']
+                        ca = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode='all')
+                        cb = pixel_to_skycoord(wb[0], wb[1], wcs, origin=0, mode='all')
+                        lines.extend([
+                            f'A_PSF_B_WING_PA_deg = {float(ca.position_angle(cb).to_value(u.deg)%360):.5f}',
+                            f'A_PSF_B_WING_Separation_arcsec = {float(ca.separation(cb).to_value(u.arcsec)):.5f}',
+                        ])
+                lines.extend(["", f"PA_deg = {pa:.5f}", f"Separation_arcsec = {rho:.5f}"])
+                diag_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+                print(f"Centroid diagnostics saved: {diag_path}")
+            except Exception as diag_exc:
+                print(f"Centroid diagnostics not created: {diag_exc}")
+
             sep_ratio = rho / row.sep_last if row.sep_last > 0 else np.nan
             if not np.isfinite(sep_ratio) or not (0.75 <= sep_ratio <= 1.25):
                 raise ValueError(
-                    f'A mért szeparáció ({rho:.2f}") túlzottan eltér '
-                    f'a WDS referenciaértéktől ({row.sep_last:.2f}").'
+                    f'The measured separation ({rho:.2f}") differs too much '
+                    f'from the WDS reference value ({row.sep_last:.2f}").'
                 )
 
             dmag_psf = abs(float(dmag_psf))
@@ -1031,32 +1329,17 @@ def main() -> int:
                 fitted_fwhm=fitted_fwhm,
             )
 
-            # Fényességi plausibility-check:
-            # ne fogadjunk el egy véletlen, jóval halványabb/fényesebb csillagot
-            # pusztán azért, mert a várt pozíció közelében van.
-            wds_dmag = abs(float(row.mag_b) - float(row.mag_a))
-            dmag_diff = abs(abs(float(dmag)) - wds_dmag)
-
+            # A WDS magnitúdók nem szolgálnak kizárási feltételként.
+            # A ténylegesen mért (előjeles) Delta mag marad a kimenet alapja.
             print(
-                f"Fotometria: PSF Δmag={dmag_psf:.2f}, "
-                f"AIJ-szerű apertúrás Δmag={dmag:.2f}, r={r_ap:.2f} px"
+                f"Photometry: PSF Δmag={dmag_psf:.2f}, "
+                f"AIJ-style aperture Δmag={dmag:.2f}, r={r_ap:.2f} px"
             )
-            print(
-                f"Fényességi ellenőrzés: WDS Δmag={wds_dmag:.2f}, "
-                f"eltérés={dmag_diff:.2f} mag"
-            )
-
-            if dmag_diff > MAX_WDS_DMAG_DIFFERENCE:
-                raise ValueError(
-                    f"A detektált társ fényessége nem egyezik eléggé a WDS-adattal "
-                    f"(WDS Δmag={wds_dmag:.2f}, mért Δmag={dmag:.2f}, "
-                    f"eltérés={dmag_diff:.2f} mag)."
-                )
 
             obs_time = observation_time_text(header)
             out = write_result_txt(fit_path, row, obs_time, pa, rho, dmag)
 
-            print("\nEREDMÉNY")
+            print("\nRESULT")
             print("-" * 40)
             print(f"Object:      {row.pair_name}")
             print(f"WDS:         {row.wds_id}")
@@ -1079,21 +1362,21 @@ def main() -> int:
                 print(f"PNG nem készült: {image_exc}")
 
         except Exception as exc:
-            print("\nMÉRÉS ELUTASÍTVA")
+            print("\nMEASUREMENT REJECTED")
             print("-" * 40)
             print(str(exc))
 
         while True:
-            print("\nMit szeretnél?")
-            print("  1 - Új mérés")
-            print("  2 - Kilépés")
-            choice = input("Választás: ").strip()
+            print("\nWhat would you like to do?")
+            print("  1 - New measurement")
+            print("  2 - Exit")
+            choice = input("Selection: ").strip()
             if choice == "1":
                 print()
                 break
             if choice == "2":
                 return 0
-            print("Érvénytelen választás.")
+            print("Invalid selection.")
 
 
 

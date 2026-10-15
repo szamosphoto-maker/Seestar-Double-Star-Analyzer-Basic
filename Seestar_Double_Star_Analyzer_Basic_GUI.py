@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Seestar Double Star Analyzer Basic GUI v1.0
+Seestar Double Star Analyzer Basic GUI v1.0.3
 
-Grafikus kezelőfelület a rögzített Basic v1.1a mérési motorhoz.
-A mérési algoritmust ez a fájl nem módosítja.
+Graphical interface for the Basic v1.1e measurement engine.
+This file does not change the measurement algorithm.
 """
 
 from __future__ import annotations
@@ -23,16 +23,16 @@ import photoanalyzer_basic as engine
 
 
 APP_TITLE = "Seestar Double Star Analyzer Basic"
-GUI_VERSION = "1.0.2"
+GUI_VERSION = "1.0.3"
 
 
 def external_app_dir() -> Path:
     """
-    Forrásból futva: a .py fájl mappája.
-    PyInstaller one-file EXE-ből futva: az EXE mappája.
+    When running from source: the .py file directory.
+    When running as a PyInstaller one-file EXE: the EXE directory.
 
-    A Seestar_wds.csv szándékosan külső fájl marad az EXE mellett,
-    így később külön is frissíthető.
+    Seestar_wds.csv intentionally stays external alongside the EXE,
+    so it can be updated independently.
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -42,7 +42,7 @@ def external_app_dir() -> Path:
 class MatchDialog(tk.Toplevel):
     def __init__(self, parent, matches):
         super().__init__(parent)
-        self.title("Komponenspár kiválasztása")
+        self.title("Select Component Pair")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -55,13 +55,13 @@ class MatchDialog(tk.Toplevel):
 
         ttk.Label(
             outer,
-            text="Több megfelelő komponenspár található.",
+            text="Multiple matching component pairs found.",
             font=("Segoe UI", 11, "bold"),
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         ttk.Label(
             outer,
-            text="Válaszd ki, melyiket szeretnéd megmérni:",
+            text="Select the pair you want to measure:",
         ).grid(row=1, column=0, sticky="w", pady=(0, 10))
 
         for i, row in enumerate(matches):
@@ -83,8 +83,8 @@ class MatchDialog(tk.Toplevel):
         buttons = ttk.Frame(outer)
         buttons.grid(row=3 + len(matches), column=0, sticky="e", pady=(14, 0))
 
-        ttk.Button(buttons, text="Mégse", command=self.cancel).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(buttons, text="Kiválasztás", command=self.accept).grid(row=0, column=1)
+        ttk.Button(buttons, text="Cancel", command=self.cancel).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Select", command=self.accept).grid(row=0, column=1)
 
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.bind("<Return>", lambda _e: self.accept())
@@ -114,7 +114,7 @@ class AnalyzerGUI(tk.Tk):
         self.catalog = None
         self.fit_path = tk.StringVar()
         self.object_name = tk.StringVar()
-        self.status_text = tk.StringVar(value="Katalógus betöltése...")
+        self.status_text = tk.StringVar(value="Loading catalog...")
         self.current_row = None
 
         self._build_ui()
@@ -141,7 +141,7 @@ class AnalyzerGUI(tk.Tk):
 
         subtitle = ttk.Label(
             main,
-            text="Egyszerű kettőscsillag-mérés Seestar stacked FIT képből",
+            text="Double-star measurements from Seestar stacked FITS images",
             font=("Segoe UI", 10),
         )
         subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 22))
@@ -149,33 +149,33 @@ class AnalyzerGUI(tk.Tk):
         ttk.Label(main, text="Seestar stacked FIT:").grid(row=2, column=0, sticky="w", padx=(0, 12))
         self.fit_entry = ttk.Entry(main, textvariable=self.fit_path)
         self.fit_entry.grid(row=2, column=1, sticky="ew")
-        ttk.Button(main, text="Tallózás...", command=self.browse_fit).grid(row=2, column=2, padx=(10, 0))
+        ttk.Button(main, text="Browse...", command=self.browse_fit).grid(row=2, column=2, padx=(10, 0))
 
-        ttk.Label(main, text="Kettős azonosító:").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(14, 0))
+        ttk.Label(main, text="Double-star designation:").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(14, 0))
         self.object_entry = ttk.Entry(main, textvariable=self.object_name, width=25)
         self.object_entry.grid(row=3, column=1, sticky="w", pady=(14, 0))
         self.object_entry.bind("<Return>", lambda _e: self.start_measurement())
 
-        self.measure_button = ttk.Button(main, text="MÉRÉS", command=self.start_measurement)
+        self.measure_button = ttk.Button(main, text="MEASURE", command=self.start_measurement)
         self.measure_button.grid(row=4, column=0, columnspan=3, pady=(22, 18), ipadx=35, ipady=7)
 
         ttk.Separator(main).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 18))
 
-        result_frame = ttk.LabelFrame(main, text=" Eredmény ", padding=16)
+        result_frame = ttk.LabelFrame(main, text=" Results ", padding=16)
         result_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
         main.rowconfigure(6, weight=1)
         result_frame.columnconfigure(1, weight=1)
 
         self.result_vars = {}
         fields = [
-            ("Object", "Objektum"),
+            ("Object", "Object"),
             ("WDS", "WDS"),
             ("PA", "PA"),
-            ("Separation", "Szeparáció"),
+            ("Separation", "Separation"),
             ("Mag1", "Mag1 (WDS)"),
-            ("Mag2", "Mag2 (számított)"),
+            ("Mag2", "Mag2 (calculated)"),
             ("Delta mag", "Δmag"),
-            ("Quality", "Minőség"),
+            ("Quality", "Quality"),
         ]
         for r, (key, label) in enumerate(fields):
             ttk.Label(result_frame, text=f"{label}:").grid(row=r, column=0, sticky="w", padx=(0, 18), pady=5)
@@ -196,10 +196,10 @@ class AnalyzerGUI(tk.Tk):
         bottom.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(18, 0))
         bottom.columnconfigure(1, weight=1)
 
-        self.new_button = ttk.Button(bottom, text="Új mérés", command=self.new_measurement)
+        self.new_button = ttk.Button(bottom, text="New measurement", command=self.new_measurement)
         self.new_button.grid(row=0, column=0)
         ttk.Label(bottom, textvariable=self.status_text).grid(row=0, column=1, padx=18, sticky="w")
-        ttk.Button(bottom, text="Kilépés", command=self.destroy).grid(row=0, column=2)
+        ttk.Button(bottom, text="Exit", command=self.destroy).grid(row=0, column=2)
 
     def _load_catalog_thread(self):
         self.measure_button.configure(state="disabled")
@@ -216,19 +216,19 @@ class AnalyzerGUI(tk.Tk):
 
     def _catalog_loaded(self, catalog):
         self.catalog = catalog
-        self.status_text.set(f"Katalógus betöltve: {len(catalog)} pár")
+        self.status_text.set(f"Catalog loaded: {len(catalog)} pairs")
         self.measure_button.configure(state="normal")
 
     def _catalog_failed(self, msg):
-        self.status_text.set("Katalógushiba")
-        messagebox.showerror("Hiba", f"A katalógus nem tölthető be:\n\n{msg}")
+        self.status_text.set("Catalog error")
+        messagebox.showerror("Error", f"Could not load catalog:\n\n{msg}")
 
     def browse_fit(self):
         filename = filedialog.askopenfilename(
-            title="Seestar stacked FIT kiválasztása",
+            title="Select Seestar stacked FITS file",
             filetypes=[
-                ("FITS fájlok", "*.fit *.fits *.fts"),
-                ("Minden fájl", "*.*"),
+                ("FITS files", "*.fit *.fits *.fts"),
+                ("All files", "*.*"),
             ],
         )
         if filename:
@@ -240,38 +240,38 @@ class AnalyzerGUI(tk.Tk):
         self.saved_var.set("")
 
     def new_measurement(self):
-        # A FIT útvonalát szándékosan megtartjuk, mert ugyanarról a képről
-        # gyakran több kettőst is egymás után mérünk.
+        # Keep the FITS path to allow consecutive measurements
+        # of multiple double stars in the same image.
         self.object_name.set("")
         self.current_row = None
         self.clear_result()
-        self.status_text.set("Új mérésre kész.")
+        self.status_text.set("Ready for a new measurement.")
         self.object_entry.focus_set()
 
     def start_measurement(self):
         if self.catalog is None:
-            messagebox.showinfo("Kis türelmet", "A katalógus még betöltés alatt van.")
+            messagebox.showinfo("Please wait", "The catalog is still loading.")
             return
 
         raw_path = self.fit_path.get().strip().strip('"')
         query = self.object_name.get().strip()
 
         if not raw_path:
-            messagebox.showwarning("Hiányzó FIT", "Válassz ki egy Seestar stacked FIT fájlt.")
+            messagebox.showwarning("Missing FITS file", "Select a Seestar stacked FITS file.")
             return
         fit_path = Path(raw_path)
         if not fit_path.is_file() or fit_path.suffix.lower() not in engine.FITS_EXTENSIONS:
-            messagebox.showerror("Hibás FIT", "A megadott FIT/FITS fájl nem található vagy nem használható.")
+            messagebox.showerror("Invalid FITS file", "The selected FITS file was not found or is not supported.")
             return
         if not query:
-            messagebox.showwarning("Hiányzó azonosító", "Írd be a kettős azonosítóját, például: HJ 1362")
+            messagebox.showwarning("Missing designation", "Enter a double-star designation, e.g. HJ 1362.")
             return
 
         matches = engine.find_matches(self.catalog, query)
         if not matches:
             messagebox.showinfo(
-                "Nincs találat",
-                "Nincs ilyen kettős a Seestar katalógusban.",
+                "No matches",
+                "This double star was not found in the Seestar catalog.",
             )
             return
 
@@ -288,7 +288,7 @@ class AnalyzerGUI(tk.Tk):
         self.clear_result()
         self.measure_button.configure(state="disabled")
         self.new_button.configure(state="disabled")
-        self.status_text.set("Mérés folyamatban...")
+        self.status_text.set("Measurement in progress...")
         self.update_idletasks()
 
         threading.Thread(
@@ -338,8 +338,8 @@ class AnalyzerGUI(tk.Tk):
         sep_ratio = rho / row.sep_last if row.sep_last > 0 else np.nan
         if not np.isfinite(sep_ratio) or not (0.75 <= sep_ratio <= 1.25):
             raise ValueError(
-                f'A mért szeparáció ({rho:.2f}") túlzottan eltér '
-                f'a WDS referenciaértéktől ({row.sep_last:.2f}").'
+                f'The measured separation ({rho:.2f}") differs too much '
+                f'from the WDS reference value ({row.sep_last:.2f}").'
             )
 
         dmag, flux_a, flux_b, r_ap = engine.aperture_delta_mag(
@@ -349,12 +349,8 @@ class AnalyzerGUI(tk.Tk):
             fitted_fwhm=fitted_fwhm,
         )
 
-        wds_dmag = abs(float(row.mag_b) - float(row.mag_a))
-        dmag_diff = abs(abs(float(dmag)) - wds_dmag)
-        if dmag_diff > engine.MAX_WDS_DMAG_DIFFERENCE:
-            raise ValueError(
-                "A detektált társ fényessége nem egyezik eléggé a WDS-adattal."
-            )
+        # A discrepancy in WDS magnitudes is not a rejection criterion.
+        # The engine validates the photometric flux.
 
         obs_time = engine.observation_time_text(header)
         out = engine.write_result_txt(
@@ -395,40 +391,32 @@ class AnalyzerGUI(tk.Tk):
         self.result_vars["Mag2"].set(f'{result["mag2"]:.2f} mag')
         self.result_vars["Delta mag"].set(f'{result["dmag"]:.2f} mag')
         self.result_vars["Quality"].set(result["quality"])
-        saved_text = f'TXT mentve: {result["saved"]}'
+        saved_text = f'TXT saved: {result["saved"]}'
         if result["png"]:
-            saved_text += f'\nPNG mentve: {result["png"]}'
+            saved_text += f'\nPNG saved: {result["png"]}'
         else:
-            saved_text += f'\nPNG nem készült: {result["image_error"]}'
+            saved_text += f'\nPNG not created: {result["image_error"]}'
         self.saved_var.set(saved_text)
-        self.status_text.set("Mérés kész.")
+        self.status_text.set("Measurement completed.")
         self.measure_button.configure(state="normal")
         self.new_button.configure(state="normal")
 
     def _measurement_failed(self, msg):
-        self.status_text.set("A mérés nem végezhető el megbízhatóan.")
+        self.status_text.set("A reliable measurement could not be obtained.")
         self.measure_button.configure(state="normal")
         self.new_button.configure(state="normal")
 
-        # Kezdőbarát üzenetek: a technikai részleteket nem tesszük az arcába.
+        # Engine messages are already in English. Keep useful details visible.
         friendly = msg
-        if "Széles pár:" in msg or "nem detektálható helyi fényességcsúcs" in msg:
-            friendly = msg
-        elif "nem különül el" in msg:
-            friendly = "A két komponens ezen a képen nem különül el megbízhatóan."
-        elif "nincs önállóan detektálható" in msg:
-            friendly = "Az egyik komponens ezen a képen nem detektálható önálló csillagként."
-        elif "fényessége nem egyezik" in msg:
-            friendly = "A megtalált csillag fényessége túlzottan eltér a WDS alapján várttól."
-        elif "szeparáció" in msg and "eltér" in msg:
-            friendly = "A megtalált komponenspár helyzete túlzottan eltér a WDS alapján várttól."
-        elif "konvergált" in msg or "konvergált" in msg.lower():
-            friendly = "A csillagprofil illesztése ezen a képen nem volt megbízható."
+        if "cannot be resolved as separate stars" in msg:
+            friendly = "The two components are not reliably resolved in this image."
+        elif "No independently detectable stellar source" in msg:
+            friendly = "One component cannot be detected as an independent star in this image."
+        elif "PSF fit did not converge" in msg:
+            friendly = "The stellar profile fit did not converge for this image."
 
-        messagebox.showwarning(
-            "Mérés elutasítva",
-            friendly,
-        )
+        messagebox.showwarning("Measurement rejected", friendly)
+
 
 
 if __name__ == "__main__":

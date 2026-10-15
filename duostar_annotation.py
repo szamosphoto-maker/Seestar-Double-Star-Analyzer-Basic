@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,29 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.wcs.utils import proj_plane_pixel_scales, skycoord_to_pixel
 from scipy.ndimage import map_coordinates
+
+
+def _component_labels(row):
+    """Read selected WDS Components from WDSRow.comp (or a CSV/dict row)."""
+    raw = getattr(row, 'comp', None)
+    if raw is None:
+        for key in ('Components', 'components', 'COMPONENTS', 'Comp', 'comp'):
+            try:
+                raw = row[key]
+            except (KeyError, TypeError, IndexError):
+                continue
+            if raw is not None and str(raw).strip():
+                break
+    value = str(raw or '').strip().upper().replace(' ', '')
+    if value in ('', 'NAN', 'NONE', '--'):
+        return 'A', 'B'
+    if '-' in value:
+        parts = value.split('-', 1)
+        if len(parts) == 2 and all(re.fullmatch(r'[A-Z]+', part) for part in parts):
+            return parts[0], parts[1]
+    if re.fullmatch(r'[A-Z]{2}', value):
+        return value[0], value[1]
+    return 'A', 'B'
 
 
 def create_annotated_image(data, wcs, row, x_a, y_a, x_b, y_b,
@@ -59,7 +83,7 @@ def create_annotated_image(data, wcs, row, x_a, y_a, x_b, y_b,
     ax.imshow(normalized, origin='lower', cmap='gray_r', extent=(-side/2,side/2,-side/2,side/2),
               interpolation='nearest', vmin=0, vmax=1)
 
-    for label, component in [('A', ca), ('B', cb)]:
+    for label, component in zip(_component_labels(row), (ca, cb)):
         east, north_offset = centre.spherical_offsets_to(component)
         cx = -east.to_value(u.arcsec)
         cy = north_offset.to_value(u.arcsec)
