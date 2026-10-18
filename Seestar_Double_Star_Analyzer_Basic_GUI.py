@@ -23,7 +23,7 @@ import photoanalyzer_basic as engine
 
 
 APP_TITLE = "Seestar Double Star Analyzer Basic"
-GUI_VERSION = "1.0.3"
+GUI_VERSION = "1.0.4"
 
 
 def external_app_dir() -> Path:
@@ -302,7 +302,23 @@ class AnalyzerGUI(tk.Tk):
             result = self._measure(fit_path, row)
             self.after(0, lambda: self._measurement_success(result))
         except Exception as exc:
-            self.after(0, lambda msg=str(exc): self._measurement_failed(msg))
+            msg = str(exc)
+            # Diagnostic also exists for REJECTED pairs, unlike measurement.txt.
+            try:
+                header, data, wcs = engine.read_header_and_data(fit_path)
+                fwhm, sources = engine.estimate_fwhm_and_sources(data)
+                details = engine.component_search_diagnostic(data, wcs, row,
+                                                              sources, fwhm)
+                diagnostic = fit_path.with_name(
+                    f"{row.disc.strip().replace(' ', '')}_{row.comp or 'pair'}_rejection_diagnostic.txt")
+                diagnostic.write_text(
+                    f"Object: {row.pair_name}\nWDS: {row.wds_id}\n"
+                    f"FITS: {fit_path.name}\nFWHM estimate: {fwhm:.2f} px\n"
+                    f"Rejection: {msg}\n\n{details}\n", encoding="utf-8")
+                msg += f"\n\nDiagnostic saved: {diagnostic}"
+            except Exception as diag_error:
+                msg += f"\n\nDiagnostic unavailable: {diag_error}"
+            self.after(0, lambda msg=msg: self._measurement_failed(msg))
 
     def _measure(self, fit_path: Path, row):
         header, data, wcs = engine.read_header_and_data(fit_path)

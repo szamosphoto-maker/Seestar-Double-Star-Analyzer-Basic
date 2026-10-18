@@ -41,7 +41,7 @@ from photutils.detection import DAOStarFinder
 
 
 APP_NAME = "Seestar Double Star Analyzer Basic"
-VERSION = "1.1e"
+VERSION = "1.1n"
 LAST_WIDE_DIAGNOSTICS = None
 LAST_WING_TESTS = None
 
@@ -310,6 +310,60 @@ def nearest_dao_position(
 
 
 
+def identify_component_at_wds(data, sources, expected_x, expected_y,
+                              fwhm_guess, label, search_radius,
+                              min_snr=6.0):
+    """Shared component identification for close and wide systems.
+
+    DAO is preferred when its centroid is genuinely near the expected
+    component. If DAO misses the star, inspect a local peak. This is an
+    *identification* only, never a measurement. Return source plus diagnostic.
+    """
+    x = float(np.asarray(expected_x).item())
+    y = float(np.asarray(expected_y).item())
+    ny, nx = data.shape
+    radius = float(search_radius)
+    cx, cy = int(round(x)), int(round(y))
+    margin = max(11, int(math.ceil(radius + 9.0)))
+    if cx-margin < 0 or cy-margin < 0 or cx+margin >= nx or cy+margin >= ny:
+        raise ValueError(f"{label}: too close to FITS boundary")
+    tile = data[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
+    yy, xx = np.mgrid[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
+    rr = np.hypot(xx-x, yy-y)
+    sky = tile[(rr >= radius+4.0) & (rr <= radius+8.0) & np.isfinite(tile)]
+    if sky.size < 25:
+        raise ValueError(f"{label}: not enough sky pixels")
+    bg = float(np.median(sky))
+    mad = float(np.median(np.abs(sky-bg)))
+    # Bright/saturated nearby stars can contaminate the background annulus.
+    # Standard deviation then measures stellar contamination, not sky noise.
+    # Use the robust MAD estimate, provided enough uncontaminated pixels remain.
+    robust_noise = max(1.4826 * mad, 1.0)
+    uncontaminated = sky[np.abs(sky-bg) <= 3.0*robust_noise]
+    if uncontaminated.size < max(25, int(0.30 * sky.size)):
+        raise ValueError(f"{label}: local background is too contaminated")
+    bg = float(np.median(uncontaminated))
+    noise = max(1.4826 * float(np.median(np.abs(uncontaminated-bg))), 1.0)
+    region = (rr <= radius) & np.isfinite(tile)
+    if not np.any(region):
+        raise ValueError(f"{label}: no valid pixels at expected position")
+    peak = float(np.max(tile[region]))
+    snr = (peak-bg)/noise
+    if snr < min_snr:
+        raise ValueError(f"{label}: local source SNR={snr:.2f} (< {min_snr:.1f})")
+    inds = np.where(region & (tile == peak))
+    k = int(np.argmin(rr[inds]))
+    px, py = float(xx[inds][k]), float(yy[inds][k])
+    if sources is not None and len(sources):
+        sx = np.asarray(sources['xcentroid'],dtype=float)
+        sy = np.asarray(sources['ycentroid'],dtype=float)
+        dist = np.hypot(sx-px,sy-py)
+        j = int(np.argmin(dist))
+        if dist[j] <= 2.0 and math.hypot(sx[j]-x,sy[j]-y) <= radius:
+            return float(sx[j]), float(sy[j]), 'DAO', snr
+    return px, py, 'local peak', snr
+
+
 def require_two_independent_sources(
     sources,
     x_a_exp: float,
@@ -317,53 +371,79 @@ def require_two_independent_sources(
     x_b_exp: float,
     y_b_exp: float,
     fwhm_guess: float,
+    data=None,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Find two real peaks before joint PSF fitting.
+
+    A global DAO omission alone is not a rejection. When necessary, inspect
+    local peaks close to each WDS position using the wide-mode SNR check.
+    Keep the distinct-source and catalog-separation sanity checks.
     """
-    Basic biztonsági ellenőrzés:
-    csak akkor engedjük a mérést, ha A és B várható helyén
-    két külön DAOStarFinder-forrás ténylegesen detektálható.
-    """
-    search_radius = max(2.5 * float(fwhm_guess), 5.0)
+    expected_sep_pix = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
+    if expected_sep_pix <= 0:
+        raise ValueError("Invalid expected component separation.")
 
-    dao_a = nearest_dao_position(sources, x_a_exp, y_a_exp, search_radius)
-    dao_b = nearest_dao_position(sources, x_b_exp, y_b_exp, search_radius)
+    # Avoid excessively large DAO radii taking a neighbouring star as a
+    # component, especially in crowded open-cluster fields.
+    radius = min(max(2.0, 0.30 * expected_sep_pix), 5.0)
+    dao_a = nearest_dao_position(sources, x_a_exp, y_a_exp, radius)
+    dao_b = nearest_dao_position(sources, x_b_exp, y_b_exp, radius)
 
-    if dao_a is None:
-        raise ValueError(
-            "No independently detectable stellar source at the first component position."
-        )
+    def distinct(a, b):
+        if a is None or b is None:
+            return False
+        sep = math.hypot(a[0] - b[0], a[1] - b[1])
+        return sep >= max(1.5, 0.60 * float(fwhm_guess))
 
-    if dao_b is None:
-        raise ValueError(
-            "No independently detectable stellar source at the second component position."
-        )
+    if not distinct(dao_a, dao_b):
+        if data is None:
+            raise ValueError("Two independent components were not detected, and local search is unavailable.")
+        # In the fallback, inspect the *same* WDS positions, not arbitrary
+        # nearby detections. A local maximum still needs SNR >= 6 (the
+        # existing wide-pair criterion), and must be a distinct source.
+        local_radius = min(3.0, max(1.5, 0.30 * expected_sep_pix))
+        try:
+            la = locate_wide_component(data, sources, x_a_exp, y_a_exp,
+                                       fwhm_guess, "A", search_radius=local_radius)
+            lb = locate_wide_component(data, sources, x_b_exp, y_b_exp,
+                                       fwhm_guess, "B", search_radius=local_radius)
+        except ValueError as exc:
+            raise ValueError(f"Independent source detection failed; local check: {exc}") from exc
+        dao_a, dao_b = la[:2], lb[:2]
+        print(f"Close pair: local-source fallback A={la[2]}, B={lb[2]}")
 
-    measured_sep_pix = math.hypot(
-        dao_a[0] - dao_b[0],
-        dao_a[1] - dao_b[1],
-    )
+    if not distinct(dao_a, dao_b):
+        raise ValueError("The two components cannot be resolved as separate stars in the stacked FITS image.")
 
-    min_independent_sep = max(1.5, 0.75 * float(fwhm_guess))
-    if measured_sep_pix < min_independent_sep:
-        raise ValueError(
-            "The two components cannot be resolved as separate stars in the stacked FITS image."
-        )
-
-    expected_sep_pix = math.hypot(
-        x_a_exp - x_b_exp,
-        y_a_exp - y_b_exp,
-    )
-
-    if expected_sep_pix > 0:
-        ratio = measured_sep_pix / expected_sep_pix
-        if not (0.70 <= ratio <= 1.30):
-            raise ValueError(
-                "The separation of the detected stars differs too much "
-                "from the WDS reference separation."
-            )
+    measured_sep_pix = math.hypot(dao_a[0] - dao_b[0], dao_a[1] - dao_b[1])
+    ratio = measured_sep_pix / expected_sep_pix
+    # Coarse pre-fit guard only. The definitive +/-25% comparison occurs
+    # after PSF fitting and is deliberately unchanged.
+    if not (0.60 <= ratio <= 1.40):
+        raise ValueError("Detected component separation is inconsistent with the WDS positions.")
 
     return dao_a, dao_b
 
+
+def component_search_diagnostic(data, wcs, row, sources, fwhm_guess):
+    """Non-invasive component diagnostics; never changes accepted measurements."""
+    expected_a = row.coord
+    expected_b = expected_a.directional_offset_by(
+        position_angle=row.pa_last*u.deg, separation=row.sep_last*u.arcsec)
+    lines = []
+    sep = float(row.sep_last)
+    for label, coord in [('first',expected_a),('second',expected_b)]:
+        x,y = skycoord_to_pixel(coord, wcs, origin=0, mode='all')
+        lines.append(f"{label}: WDS predicted pixel=({float(x):.3f}, {float(y):.3f})")
+        for r in (3.0, 6.0):
+            try:
+                px,py,method,snr=identify_component_at_wds(
+                    data,sources,x,y,fwhm_guess,label,r,min_snr=-1e9)
+                lines.append(f"  radius={r:.1f}px peak=({px:.2f},{py:.2f}) "
+                             f"method={method} SNR={snr:.2f}")
+            except Exception as exc:
+                lines.append(f"  radius={r:.1f}px failed: {exc}")
+    return '\n'.join(lines)
 
 
 def fit_pair_on_frame(
@@ -395,16 +475,61 @@ def fit_pair_on_frame(
     if not all(np.isfinite([x_a_exp, y_a_exp, x_b_exp, y_b_exp])):
         raise ValueError("Cannot transform the expected component position into pixel coordinates.")
 
-    # Basic módban csak akkor mérünk, ha mindkét komponens
-    # külön, önálló csillagforrásként ténylegesen detektálható.
-    dao_a, dao_b = require_two_independent_sources(
-        sources=sources,
-        x_a_exp=x_a_exp,
-        y_a_exp=y_a_exp,
-        x_b_exp=x_b_exp,
-        y_b_exp=y_b_exp,
-        fwhm_guess=fwhm_guess,
-    )
+    # Elsőként az eredeti, két független csillagcsúcsra épülő módszer.
+    # Összeérő PSF esetén a B csúcsa elmaradhat: ekkor szigorúan
+    # WDS-közeli kezdőpozícióból végzünk KÉT komponensű illesztést.
+    blended_fallback = False
+    legacy_detected = False
+    # Regression-first: preserve the original v1.1e DAO association if it
+    # really identifies TWO different stars with a plausible separation.
+    # This path is intentionally not affected by the newer wing heuristic.
+    legacy_radius = max(2.5 * float(fwhm_guess), 5.0)
+    legacy_a = nearest_dao_position(sources, x_a_exp, y_a_exp, legacy_radius)
+    legacy_b = nearest_dao_position(sources, x_b_exp, y_b_exp, legacy_radius)
+    if legacy_a is not None and legacy_b is not None:
+        legacy_gap = math.hypot(legacy_a[0]-legacy_b[0],
+                                legacy_a[1]-legacy_b[1])
+        wds_gap = math.hypot(x_a_exp-x_b_exp, y_a_exp-y_b_exp)
+        if legacy_gap >= max(1.5, 0.75*float(fwhm_guess)) and wds_gap > 0 \
+                and 0.70 <= legacy_gap/wds_gap <= 1.30:
+            legacy_detected = True
+            dao_a, dao_b = legacy_a, legacy_b
+            print('Close pair: original v1.1e independent-DAO path selected.')
+    if not legacy_detected:
+      try:
+        dao_a, dao_b = require_two_independent_sources(
+            data=data, sources=sources,
+            x_a_exp=x_a_exp, y_a_exp=y_a_exp,
+            x_b_exp=x_b_exp, y_b_exp=y_b_exp,
+            fwhm_guess=fwhm_guess,
+        )
+      except ValueError as exc:
+          blended_fallback = True
+          print(f"Blended pair: independent peaks unavailable ({exc}); "
+                "trying WDS-guided joint PSF fit.")
+          # A DAO A-komponens pozícióját csak nagyon közeli egyezésnél használjuk.
+          # A B-t nem helyettesítjük az A csúcsával.
+          a_radius = min(3.0, max(1.5, 0.25 * math.hypot(
+              x_b_exp - x_a_exp, y_b_exp - y_a_exp)))
+          dao_a = nearest_dao_position(sources, x_a_exp, y_a_exp, a_radius)
+          if dao_a is None:
+              dao_a = (float(x_a_exp), float(y_a_exp))
+          dao_b = (float(x_b_exp), float(y_b_exp))
+
+    # Regression guard: for a tight pair the bright primary's wing can be
+    # misidentified as the secondary even when the local SNR is huge.
+    # Prefer catalogue-guided initialisation to a demonstrably wrong peak.
+    # This changes only starting coordinates, never the reported measurement.
+    predicted_gap = math.hypot(x_b_exp-x_a_exp, y_b_exp-y_a_exp)
+    detected_gap = math.hypot(dao_b[0]-dao_a[0], dao_b[1]-dao_a[1])
+    b_offset = math.hypot(dao_b[0]-x_b_exp, dao_b[1]-y_b_exp)
+    if (not legacy_detected and not blended_fallback and predicted_gap <= 2.5*float(fwhm_guess)
+            and (detected_gap < 0.80*predicted_gap
+                 or b_offset > min(1.5, 0.25*predicted_gap))):
+        print('Close pair: suspect B peak in primary PSF wing; '
+              'using WDS-guided joint fit.')
+        blended_fallback = True
+        dao_b = (float(x_b_exp), float(y_b_exp))
 
     x_a0, y_a0 = dao_a
     x_b0, y_b0 = dao_b
@@ -473,12 +598,14 @@ def fit_pair_on_frame(
         sigma0, sigma0, 0.0, background,
     ], dtype=float)
 
+    # WDS-vezérelt módban a B csillag nem vándorolhat át egy másik csúcsra.
+    shift_b = min(MAX_POSITION_SHIFT_PIX, 1.5) if blended_fallback else MAX_POSITION_SHIFT_PIX
     lower = np.array([
         x_a0 - MAX_POSITION_SHIFT_PIX,
         y_a0 - MAX_POSITION_SHIFT_PIX,
         0.0,
-        x_b0 - MAX_POSITION_SHIFT_PIX,
-        y_b0 - MAX_POSITION_SHIFT_PIX,
+        x_b0 - shift_b,
+        y_b0 - shift_b,
         0.0,
         0.45,
         0.45,
@@ -490,8 +617,8 @@ def fit_pair_on_frame(
         x_a0 + MAX_POSITION_SHIFT_PIX,
         y_a0 + MAX_POSITION_SHIFT_PIX,
         max(float(np.nanmax(cut) - background) * 5.0, amp_a0 * 5.0),
-        x_b0 + MAX_POSITION_SHIFT_PIX,
-        y_b0 + MAX_POSITION_SHIFT_PIX,
+        x_b0 + shift_b,
+        y_b0 + shift_b,
         max(float(np.nanmax(cut) - background) * 5.0, amp_b0 * 5.0),
         max(8.0, 2.0 * fwhm_guess),
         max(8.0, 2.0 * fwhm_guess),
@@ -505,20 +632,85 @@ def fit_pair_on_frame(
         model = gaussian_pair_model(params, xx, yy)
         return ((model - cut) / noise).ravel()
 
-    result = least_squares(
-        residuals,
-        p0,
-        bounds=(lower, upper),
-        loss="soft_l1",
-        f_scale=1.0,
-        max_nfev=3000,
-        xtol=1e-10,
-        ftol=1e-10,
-        gtol=1e-10,
-    )
+    # A 10-paraméteres közös PSF illesztés zajos Seestar-képeken
+    # nem mindig teljesíti az indokolatlanul szigorú 1e-10 toleranciát.
+    # Először a bevált kezdőértékekkel próbálunk, majd szükség esetén
+    # eltérő kezdő PSF-szélességekkel. Sikertelen fitet NEM fogadunk el.
+    attempts = []
+    for width_scale in (1.0, 0.75, 1.4):
+        initial = p0.copy()
+        initial[6:8] = np.clip(initial[6:8] * width_scale,
+                               lower[6:8] + 1e-5, upper[6:8] - 1e-5)
+        try:
+            candidate = least_squares(
+                residuals, initial, bounds=(lower, upper),
+                loss="soft_l1", f_scale=1.0,
+                max_nfev=4500, xtol=1e-7, ftol=1e-7, gtol=1e-7,
+            )
+        except (ValueError, FloatingPointError) as exc:
+            attempts.append(str(exc))
+            continue
+        if candidate.success and np.all(np.isfinite(candidate.x)):
+            result = candidate
+            break
+        attempts.append(str(candidate.message))
+    else:
+        raise RuntimeError("A PSF-illesztés több kezdőértékkel sem konvergált: "
+                           + "; ".join(attempts))
 
-    if not result.success:
-        raise RuntimeError(f"A PSF-illesztés nem konvergált: {result.message}")
+    # A két komponens egymásra csúszását ne próbáljuk WDS-értékre
+    # kényszerített szeparációval javítani. Csak az első fit összeomlása
+    # esetén próbálunk új, önálló kezdőpozíciókhoz kötött illesztéseket.
+    fitted_gap = math.hypot(result.x[3]-result.x[0], result.x[4]-result.x[1])
+    independent_gap = math.hypot(x_b0-x_a0, y_b0-y_a0)
+    collapse_limit = max(1.0, 0.45 * independent_gap)
+    if fitted_gap < collapse_limit and independent_gap > 2.0:
+        print(f'Close pair: collapsed initial PSF solution '
+              f'({fitted_gap:.2f} px); attempting independent-centroid refits.')
+        # A kezdeti koordináták körüli külön korlátok nem engedik, hogy a
+        # két pozíció ugyanabba a lokális maximumba vándoroljon. A mérés
+        # továbbra is szabad PSF-centroidokból történik, nem WDS-ből.
+        max_safe_shift = min(1.15, 0.25 * independent_gap)
+        tight_low = lower.copy()
+        tight_high = upper.copy()
+        for k, start in ((0,x_a0),(1,y_a0),(3,x_b0),(4,y_b0)):
+            tight_low[k] = start - max_safe_shift
+            tight_high[k] = start + max_safe_shift
+        candidates = []
+        for width_scale in (0.75, 1.0, 1.4):
+            for secondary_scale in (0.4, 1.0, 1.8):
+                start = p0.copy()
+                start[6:8] = np.clip(sigma0*width_scale,
+                                      tight_low[6:8]+1e-5, tight_high[6:8]-1e-5)
+                start[5] = np.clip(amp_b0*secondary_scale,
+                                    tight_low[5]+1e-5, tight_high[5]-1e-5)
+                start = np.clip(start, tight_low+1e-5, tight_high-1e-5)
+                try:
+                    trial = least_squares(
+                        residuals, start, bounds=(tight_low,tight_high),
+                        loss='soft_l1', f_scale=1.0, max_nfev=4500,
+                        xtol=1e-7, ftol=1e-7, gtol=1e-7)
+                except (ValueError, FloatingPointError):
+                    continue
+                if not trial.success or not np.all(np.isfinite(trial.x)):
+                    continue
+                gap = math.hypot(trial.x[3]-trial.x[0], trial.x[4]-trial.x[1])
+                if gap < collapse_limit or trial.x[2] <= 0 or trial.x[5] <= 0:
+                    continue
+                # Határon megtapadó centroid nem megbízható mérés.
+                if any(min(trial.x[k]-tight_low[k],tight_high[k]-trial.x[k]) < 0.03
+                       for k in (0,1,3,4)):
+                    continue
+                r = residuals(trial.x)
+                score = float(np.sum(2.0*(np.sqrt(1.0+r*r)-1.0)))
+                candidates.append((score,trial))
+        if not candidates:
+            raise ValueError('The two fitted centroids collapsed; constrained refits '
+                             'did not yield a stable, separated solution.')
+        candidates.sort(key=lambda item:item[0])
+        result = candidates[0][1]
+        print(f'Close pair: separated PSF refit found '
+              f'({math.hypot(result.x[3]-result.x[0],result.x[4]-result.x[1]):.2f} px).')
 
     x_a, y_a, amp_a, x_b, y_b, amp_b, sx, sy, _, _ = result.x
 
@@ -538,6 +730,52 @@ def fit_pair_on_frame(
 
     if amp_a <= 0 or amp_b <= 0:
         raise ValueError("Non-positive fitted component flux.")
+
+    if blended_fallback:
+        # A két-Gauss illesztés matematikailag konvergálhat egyetlen csillagra
+        # is. Önálló egy-Gauss modellt is illesztünk UGYANAZOKRA a pixelekre;
+        # csak a kimutathatóan jobb kettős modellt fogadjuk el.
+        # A teszt nem módosítja a PSF-alapú PA/rho értékeket.
+        def single_residual(params):
+            x, y, amp, sig_x, sig_y, theta, bg = params
+            ct, st = np.cos(theta), np.sin(theta)
+            dx, dy = xx - x, yy - y
+            xr, yr = ct*dx + st*dy, -st*dx + ct*dy
+            model = bg + amp*np.exp(-0.5*((xr/sig_x)**2 + (yr/sig_y)**2))
+            return ((model-cut)/noise).ravel()
+
+        single_start = np.array([x_a0, y_a0, amp_a0,
+                                 sigma0, sigma0, 0.0, background], dtype=float)
+        single_low = np.array([x_a0-4, y_a0-4, 0, .45, .45,
+                               -math.pi/2, float(np.nanmin(cut))-5*noise])
+        single_high = np.array([x_a0+4, y_a0+4,
+                                max(float(np.nanmax(cut)-background)*5, amp_a0*5),
+                                max(8.,2*fwhm_guess), max(8.,2*fwhm_guess),
+                                math.pi/2, float(np.nanmax(cut))])
+        single_start = np.clip(single_start, single_low+1e-5, single_high-1e-5)
+        single_fit = least_squares(single_residual, single_start,
+                                   bounds=(single_low, single_high),
+                                   loss='soft_l1', f_scale=1.0,
+                                   max_nfev=4500, xtol=1e-7, ftol=1e-7, gtol=1e-7)
+        if not single_fit.success or not np.all(np.isfinite(single_fit.x)):
+            raise ValueError('Blended pair: single-star comparison fit failed.')
+        # Only assess residuals in the two-star vicinity, not empty sky pixels.
+        neighbourhood = ((xx-x_a_exp)**2+(yy-y_a_exp)**2 <= (2.2*fwhm_guess)**2) | \
+                        ((xx-x_b_exp)**2+(yy-y_b_exp)**2 <= (2.2*fwhm_guess)**2)
+        resid_single = single_residual(single_fit.x).reshape(cut.shape)[neighbourhood]
+        resid_double = residuals(result.x).reshape(cut.shape)[neighbourhood]
+        sse_single = float(np.mean(np.minimum(resid_single**2, 100.)))
+        sse_double = float(np.mean(np.minimum(resid_double**2, 100.)))
+        improvement = (sse_single-sse_double) / max(sse_single, 1e-9)
+        b_snr = float(amp_b/noise)
+        print(f'Blended pair validation: improvement={improvement:.1%}, '
+              f'B peak/noise={b_snr:.1f}')
+        if improvement < 0.10 or b_snr < 5.0:
+            raise ValueError('Blended pair: second component not confirmed by the '
+                             f'two-star model (improvement {improvement:.1%}, '
+                             f'B peak/noise {b_snr:.1f}).')
+        if math.hypot(x_b-x_b_exp, y_b-y_b_exp) > 2.0:
+            raise ValueError('Blended pair: fitted B position too far from WDS.')
 
     coord_a = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode="all")
     coord_b = pixel_to_skycoord(x_b, y_b, wcs, origin=0, mode="all")
@@ -837,53 +1075,14 @@ def independent_wing_centroid(data, x0, y0, fwhm_guess, nearby_sources=None):
             0.5*(estimates[0][1]+estimates[1][1]), stability, sat_count)
 
 
-def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess, label, search_radius=3.0):
-    """A wide-mode component must have a local, significant peak near WDS position.
-
-    Use DAO when possible; if saturated/weak sources are missed, use a tightly
-    bounded peak search. This never substitutes the other component and does
-    not bypass subsequent PSF fitting or astrometric quality checks.
-    """
-    # Astropy WCS may return a zero-dimensional ndarray rather than a Python float.
-    # Convert scalar coordinates before round(), scalar masks and distance checks.
-    expected_x = float(np.asarray(expected_x).item())
-    expected_y = float(np.asarray(expected_y).item())
-    ny, nx = data.shape
-    radius = float(search_radius)  # WDS-eltérés megengedett keresési sugara
-    cx, cy = int(round(expected_x)), int(round(expected_y))
-    margin = max(11, int(math.ceil(radius + 9.0)))
-    if cx - margin < 0 or cy - margin < 0 or cx + margin >= nx or cy + margin >= ny:
-        raise ValueError(f"{label}: insufficient image area for local star inspection.")
-
-    yy, xx = np.mgrid[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
-    tile = data[cy-margin:cy+margin+1, cx-margin:cx+margin+1]
-    rad = np.hypot(xx - expected_x, yy - expected_y)
-    sky = tile[(rad >= radius + 4.0) & (rad <= radius + 8.0) & np.isfinite(tile)]
-    if sky.size < 25:
-        raise ValueError(f"{label}: local background cannot be estimated.")
-    bg = float(np.median(sky))
-    mad = float(np.median(np.abs(sky-bg)))
-    noise = max(1.4826 * mad, float(np.std(sky)), 1.0)
-    local_mask = (rad <= radius) & np.isfinite(tile)
-    if not np.any(local_mask):
-        raise ValueError(f"{label}: no valid pixels at the expected position.")
-    peak = float(np.max(tile[local_mask]))
-    snr = (peak-bg)/noise
-    if snr < 6.0:
-        raise ValueError(f"{label}: nem detektálható helyi fényességcsúcs (SNR={snr:.1f}).")
-    candidates = np.where(local_mask & (tile == peak))
-    idx = int(np.argmin(rad[candidates]))
-    py = float(yy[candidates][idx]); px = float(xx[candidates][idx])
-
-    # Prefer DAO source when it is also tightly associated with the local peak.
-    if sources is not None and len(sources):
-        sx = np.asarray(sources['xcentroid'], dtype=float)
-        sy = np.asarray(sources['ycentroid'], dtype=float)
-        dist = np.hypot(sx-px, sy-py)
-        j = int(np.argmin(dist))
-        if dist[j] <= 2.0 and math.hypot(sx[j]-expected_x, sy[j]-expected_y) <= radius:
-            return float(sx[j]), float(sy[j]), 'DAO'
-    return px, py, 'local peak'
+def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess,
+                          label, search_radius=3.0):
+    """Wide mode uses the same WDS-guided source identifier as close mode."""
+    x, y, method, snr = identify_component_at_wds(
+        data, sources, expected_x, expected_y, fwhm_guess,
+        label, search_radius, min_snr=6.0)
+    print(f"{label} identification: {method}; local peak SNR={snr:.2f}")
+    return x, y, method
 
 
 def measure_wide_pair(
@@ -1090,23 +1289,29 @@ def aperture_delta_mag(
         rr = np.hypot(xx - x0, yy - y0)
         rr_other = np.hypot(xx - xo, yy - yo)
 
-        aper_mask = rr <= r_ap
-        ann_mask = (rr >= r_in) & (rr <= r_out)
+        # Szubpixel apertúra: 1.5 px sugárnál a 8 teljes pixeles minimum
+        # geometriailag nem mindig teljesíthető. A pixel lefedettségét
+        # 5x5 mintaponttal közelítjük, azonos súlyozással A és B esetén.
+        samples = 5
+        aper_weight = np.zeros_like(rr, dtype=float)
+        for oy in (np.arange(samples) + 0.5) / samples - 0.5:
+            for ox in (np.arange(samples) + 0.5) / samples - 0.5:
+                aper_weight += (np.hypot(xx + ox - x0, yy + oy - y0) <= r_ap)
+        aper_weight /= samples * samples
 
-        # A társ csillag és közvetlen környezete ne kerüljön a sky annulusba.
+        ann_mask = (rr >= r_in) & (rr <= r_out) & np.isfinite(sub)
         companion_exclusion = max(1.5 * r_ap, 1.5 * fwhm)
         ann_mask &= rr_other > companion_exclusion
-
-        aper_vals = sub[aper_mask]
         ann_vals = sub[ann_mask]
+        effective_area = float(np.sum(aper_weight[np.isfinite(sub)]))
+        if effective_area < 5.0 or len(ann_vals) < 20:
+            raise ValueError(
+                f"Insufficient usable aperture/sky pixels "
+                f"(area={effective_area:.2f}, sky={len(ann_vals)})."
+            )
+        if np.any((aper_weight > 0) & ~np.isfinite(sub)):
+            raise ValueError("Non-finite pixel inside photometric aperture.")
 
-        aper_vals = aper_vals[np.isfinite(aper_vals)]
-        ann_vals = ann_vals[np.isfinite(ann_vals)]
-
-        if len(aper_vals) < 8 or len(ann_vals) < 20:
-            raise ValueError("Insufficient usable pixels for aperture photometry.")
-
-        # Robusztus háttér, AIJ-szerű sky annulus logikával.
         bg = float(np.median(ann_vals))
         mad = float(np.median(np.abs(ann_vals - bg)))
         if mad > 0:
@@ -1115,7 +1320,7 @@ def aperture_delta_mag(
             if np.any(good):
                 bg = float(np.median(ann_vals[good]))
 
-        flux = float(np.sum(aper_vals - bg))
+        flux = float(np.sum(np.where(aper_weight > 0, aper_weight * (sub - bg), 0.0)))
         return flux
 
     flux_a = one_flux(x_a, y_a, x_b, y_b)
