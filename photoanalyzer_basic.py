@@ -41,12 +41,16 @@ from photutils.detection import DAOStarFinder
 
 
 APP_NAME = "Seestar Double Star Analyzer Basic"
-VERSION = "1.1n"
+VERSION = "1.2i"
+LAST_QUALITY = "GOOD"
+LAST_WARNINGS = []
 LAST_WIDE_DIAGNOSTICS = None
 LAST_WING_TESTS = None
 
 MIN_BASIC_SEPARATION_ARCSEC = 10.0
 MAX_BASIC_MAG = 14.0
+DAO_SEPARATION_FWHM_LIMIT = 3.0  # actual centroid separation / FWHM
+# Legacy GUI compatibility only; NOT used to select the astrometric method.
 WIDE_PAIR_THRESHOLD_ARCSEC = 30.0
 
 # EREDETI PHOTOANALYZER MÉRÉSI KONSTANSOK
@@ -1085,154 +1089,248 @@ def locate_wide_component(data, sources, expected_x, expected_y, fwhm_guess,
     return x, y, method
 
 
-def measure_wide_pair(
-    data: np.ndarray,
-    wcs: WCS,
-    row: WDSRow,
-    sources,
-    fwhm_guess: float,
-) -> tuple[float, float, float, float, float, float, float, float, float, float, float, float, float]:
+def _dao_candidates(sources, x, y, radius, forbidden=None):
+    """Valid DAO centroids in a bounded WDS neighbourhood."""
+    if sources is None or len(sources) == 0:
+        return []
+    xs = np.asarray(sources['xcentroid'], dtype=float)
+    ys = np.asarray(sources['ycentroid'], dtype=float)
+    flux_col = 'flux' if 'flux' in sources.colnames else None
+    out = []
+    for i, (sx, sy) in enumerate(zip(xs, ys)):
+        if not np.isfinite(sx) or not np.isfinite(sy):
+            continue
+        d = math.hypot(sx-x, sy-y)
+        if d > radius:
+            continue
+        if forbidden is not None and math.hypot(sx-forbidden[0], sy-forbidden[1]) < 2.0:
+            continue
+        flux = float(sources[flux_col][i]) if flux_col else float('nan')
+        if flux_col and (not np.isfinite(flux) or flux <= 0):
+            continue
+        out.append((float(sx), float(sy), d, flux))
+    return sorted(out, key=lambda v: v[2])
+
+
+def _choose_dao_candidate(candidates, label):
+    """Avoid automatic false identification in crowded fields."""
+    if not candidates:
+        raise ValueError(f'{label}: no DAO centroid in the search area.')
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        second = candidates[1]
+        # Equally plausible geometrical matches must not silently become GOOD.
+        if second[2] - chosen[2] < max(1.5, 0.15*max(chosen[2], 1.0)):
+            raise ValueError(f'{label}: ambiguous DAO identification; two candidate stars at '
+                             f'{chosen[2]:.2f} and {second[2]:.2f} px from WDS.')
+    return chosen
+
+
+def _local_dao_candidates(data, expected, radius, fwhm, forbidden=None):
+    """Second DAO search in a local cutout; output stays DAO centroids only.
+
+    Used exclusively when full-frame DAO supplied no candidate. Re-estimate
+    local sky/noise and try a few sensible widths; never use a raw pixel peak
+    or a geometric/PSF fit as an astrometric measurement.
     """
-    Széles párok (> WIDE_PAIR_THRESHOLD_ARCSEC) mérése:
-    a két komponenst külön kis kivágáson mérjük.
+    x, y = map(float, expected)
+    ny, nx = data.shape
+    half = int(math.ceil(max(radius + 3.0 * fwhm, 5.0 * fwhm, 16.0)))
+    xmin = int(round(x)) - half
+    xmax = int(round(x)) + half + 1
+    ymin = int(round(y)) - half
+    ymax = int(round(y)) + half + 1
+    if xmin < 0 or ymin < 0 or xmax > nx or ymax > ny:
+        raise ValueError('local DAO cutout extends beyond image boundary')
+    tile = np.asarray(data[ymin:ymax, xmin:xmax], dtype=float)
+    if not np.all(np.isfinite(tile)):
+        raise ValueError('local DAO cutout contains invalid pixels')
+    # Estimate sky away from the expected stellar core. This prevents a bright
+    # star from inflating the source threshold and hiding the intended source.
+    yy, xx = np.mgrid[ymin:ymax, xmin:xmax]
+    outer = np.hypot(xx - x, yy - y) >= max(2.5 * fwhm, radius + fwhm)
+    sky = tile[outer]
+    if sky.size < 40:
+        sky = tile.ravel()
+    bg = float(np.median(sky))
+    mad = float(np.median(np.abs(sky - bg)))
+    noise = max(1.4826 * mad, 1.0)
+    found = []
+    # Try the full-frame FWHM first, then a modestly narrower/broader value.
+    for width in dict.fromkeys([float(fwhm), max(2., .75 * float(fwhm)),
+                                min(8., 1.25 * float(fwhm))]):
+        finder = DAOStarFinder(fwhm=width, threshold=6.0 * noise,
+                               exclude_border=False)
+        local = finder(tile - bg)
+        if local is None or len(local) == 0:
+            continue
+        for row in local:
+            sx = float(row['xcentroid']) + xmin
+            sy = float(row['ycentroid']) + ymin
+            dist = math.hypot(sx - x, sy - y)
+            if not np.isfinite(dist) or dist > radius:
+                continue
+            if forbidden is not None and math.hypot(sx - forbidden[0], sy - forbidden[1]) < max(2.0, 1.2 * fwhm):
+                continue
+            flux = float(row['flux']) if 'flux' in local.colnames else float('nan')
+            if 'flux' in local.colnames and (not np.isfinite(flux) or flux <= 0):
+                continue
+            # Same star found with multiple FWHM settings: keep its first
+            # detection rather than treating it as a competing physical star.
+            if any(math.hypot(sx - a[0], sy - a[1]) < 1.0 for a in found):
+                continue
+            found.append((sx, sy, dist, flux))
+    if not found:
+        # Saturated or asymmetric profiles can fail DAO's default sharpness
+        # and roundness cuts. Retry only on the SAME local image, with wider
+        # morphology limits. Astrometry still uses DAO's x/y centroids.
+        for width in (max(2.0, float(fwhm)), max(2.0, .75*float(fwhm))):
+            for sigmas in (6.0, 3.0):
+                finder = DAOStarFinder(
+                    fwhm=width, threshold=sigmas*noise,
+                    sharplo=-2.0, sharphi=2.0,
+                    roundlo=-2.0, roundhi=2.0,
+                    exclude_border=False,
+                )
+                local = finder(tile-bg)
+                if local is None:
+                    continue
+                for row in local:
+                    sx = float(row['xcentroid']) + xmin
+                    sy = float(row['ycentroid']) + ymin
+                    dist = math.hypot(sx-x, sy-y)
+                    if not np.isfinite(dist) or dist > radius:
+                        continue
+                    if forbidden is not None and math.hypot(
+                            sx-forbidden[0], sy-forbidden[1]) < max(2.0, 1.2*fwhm):
+                        continue
+                    flux = float(row['flux']) if 'flux' in local.colnames else float('nan')
+                    if 'flux' in local.colnames and (not np.isfinite(flux) or flux <= 0):
+                        continue
+                    if any(math.hypot(sx-a[0], sy-a[1]) < 1.0 for a in found):
+                        continue
+                    found.append((sx, sy, dist, flux))
+            if found:
+                print(f'Local DAO: extended morphology search found {len(found)} candidate(s)')
+                break
+    if not found:
+        print(f'Local DAO: zero accepted centroids at ({x:.2f},{y:.2f}), '
+              f'radius={radius:.1f}px, local background={bg:.1f}, noise={noise:.2f}')
+    return sorted(found, key=lambda item: item[2])
+
+
+def _wide_measure_component(data, sources, expected, radius, fwhm, label, other=None):
+    """Wide pair astrometry: DAO centroid only; WDS is a search hint.
+
+    Nearby local pixels may help disambiguate DAO detections, but they are
+    never used as the reported centroid. Saturation is not an exclusion.
     """
-    expected_a = row.coord
-    expected_b = expected_a.directional_offset_by(
-        position_angle=row.pa_last * u.deg,
-        separation=row.sep_last * u.arcsec,
-    )
+    x, y = (float(v) for v in expected)
+    candidates = _dao_candidates(sources, x, y, radius, forbidden=other)
+    origin = 'global DAO'
+    if not candidates:
+        candidates = _local_dao_candidates(data, (x, y), radius, fwhm,
+                                           forbidden=other)
+        origin = 'local DAO'
+        if candidates:
+            print(f'{label}: local DAO found {len(candidates)} candidate(s)')
+    if not candidates:
+        raise ValueError(f'{label}: no DAO centroid inside {radius:.1f}px search region (global and local DAO failed)')
 
-    x_a_exp, y_a_exp = skycoord_to_pixel(expected_a, wcs, origin=0, mode="all")
-    x_b_exp, y_b_exp = skycoord_to_pixel(expected_b, wcs, origin=0, mode="all")
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        rival = candidates[1]
+        if rival[2] - chosen[2] < max(1.5, 0.15*max(chosen[2], 1.0)):
+            # Look for a real core peak near the predicted position only to
+            # identify which DAO centroid corresponds to the intended star.
+            ny, nx = data.shape
+            r = min(3.0, max(2.0, 0.75*float(fwhm)))
+            xm, ym = int(round(x)), int(round(y))
+            reach = int(math.ceil(r))
+            if xm-reach < 0 or ym-reach < 0 or xm+reach >= nx or ym+reach >= ny:
+                raise ValueError(f'{label}: too close to FITS boundary')
+            yy, xx = np.mgrid[ym-reach:ym+reach+1, xm-reach:xm+reach+1]
+            tile = data[ym-reach:ym+reach+1, xm-reach:xm+reach+1]
+            disk = (xx-x)**2+(yy-y)**2 <= r*r
+            disk &= np.isfinite(tile)
+            if not np.any(disk):
+                raise ValueError(f'{label}: ambiguous DAO identification (no local pixels)')
+            max_value = np.max(tile[disk])
+            ys, xs = np.where(disk & (tile == max_value))
+            k = int(np.argmin((xx[ys,xs]-x)**2+(yy[ys,xs]-y)**2))
+            anchor = (float(xx[ys[k],xs[k]]), float(yy[ys[k],xs[k]]))
+            sorted_by_anchor = sorted(candidates, key=lambda c:math.hypot(c[0]-anchor[0],c[1]-anchor[1]))
+            # Do not force a false GOOD identification if several DAO peaks
+            # remain similarly plausible relative to the same local source.
+            da = math.hypot(sorted_by_anchor[0][0]-anchor[0],sorted_by_anchor[0][1]-anchor[1])
+            db = math.hypot(sorted_by_anchor[1][0]-anchor[0],sorted_by_anchor[1][1]-anchor[1])
+            if db-da < 0.5:
+                raise ValueError(f'{label}: ambiguous DAO identification; nearest WDS offsets '
+                                 f'{chosen[2]:.2f}/{rival[2]:.2f}px')
+            chosen = sorted_by_anchor[0]
+            print(f'{label}: DAO association checked against local peak (no centroid fallback)')
 
-    if not all(np.isfinite([x_a_exp, y_a_exp, x_b_exp, y_b_exp])):
-        raise ValueError("Cannot transform the expected component position into pixel coordinates.")
+    dx, dy, offset = chosen[:3]
+    if other is not None and math.hypot(dx-other[0],dy-other[1]) < max(2.0,1.2*fwhm):
+        raise ValueError(f'{label}: DAO centroid belongs to the other component')
+    print(f'{label}: {origin} centroid=({dx:.3f}, {dy:.3f}); WDS offset={offset:.2f}px')
+    return dx, dy, ('DAO-local' if origin == 'local DAO' else 'DAO'), offset
 
-    # Régi WDS-adatoknál a társ pozíciója több pixellel is elmozdulhat.
-    # A nagyobb keresési sugarat a PA/szeparáció ellenőrzése ellensúlyozza.
-    expected_sep_pix = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
-    companion_search = min(12.0, max(3.0, 0.25 * expected_sep_pix))
-    primary_search = 6.0  # az A komponens WDS-koordinátája is lehet elavult
 
-    dao_ax, dao_ay, method_a = locate_wide_component(
-        data, sources, x_a_exp, y_a_exp, fwhm_guess, 'A', search_radius=primary_search
-    )
-    dao_bx, dao_by, method_b = locate_wide_component(
-        data, sources, x_b_exp, y_b_exp, fwhm_guess, 'B/C', search_radius=companion_search
-    )
-    sep_detected = math.hypot(dao_ax - dao_bx, dao_ay - dao_by)
-    sep_expected = math.hypot(x_a_exp - x_b_exp, y_a_exp - y_b_exp)
-    if sep_detected < max(2.0, 0.7 * sep_expected):
-        raise ValueError('Wide pair: same source detected twice or incorrect component identification.')
-
-    print(f'Wide identification: A={method_a} ({dao_ax:.2f}, {dao_ay:.2f}); '
-          f'B/C={method_b} ({dao_bx:.2f}, {dao_by:.2f})')
-    # Azonosítsuk pontosan, melyik komponens illesztése hibázik.
-    psf_a = "normal"
-    psf_b = "normal"
-    try:
-        x_a, y_a, amp_a = fit_single_star_centroid(
-            data, dao_ax, dao_ay, fwhm_guess, nearby_sources=sources
-        )
-    except Exception as exc:
-        psf_a = 'saturated fallback'
-        print(f'First component: standard PSF fit failed ({exc}); trying saturated-star fallback.')
-        try:
-            x_a, y_a, amp_a = fit_saturated_star_wings(
-                data, dao_ax, dao_ay, fwhm_guess, nearby_sources=sources
-            )
-        except Exception as fallback_exc:
-            raise RuntimeError(
-                f"Wide pair, first component PSF fit: {exc}; "
-                f"telített tartalék: {fallback_exc}"
-            ) from fallback_exc
-    try:
-        x_b, y_b, amp_b = fit_single_star_centroid(
-            data, dao_bx, dao_by, fwhm_guess, nearby_sources=sources
-        )
-    except Exception as exc:
-        psf_b = 'saturated fallback'
-        print(f'Second component: standard PSF fit failed ({exc}); trying saturated-star fallback.')
-        try:
-            x_b, y_b, amp_b = fit_saturated_star_wings(
-                data, dao_bx, dao_by, fwhm_guess, nearby_sources=sources
-            )
-        except Exception as fallback_exc:
-            raise RuntimeError(
-                f"Wide pair, second component PSF fit: {exc}; "
-                f"telített tartalék: {fallback_exc}"
-            ) from fallback_exc
-    # Független szárny-centroidok csak összehasonlításra. A mért PA/rho
-    # változatlanul a v1.1c illesztett koordinátákból számolódik.
-    wing_tests = {}
-    for label, dx, dy, fx, fy in (
-        ('A', dao_ax, dao_ay, x_a, y_a),
-        ('B', dao_bx, dao_by, x_b, y_b),
-    ):
-        try:
-            wx, wy, stability, sat_count = independent_wing_centroid(
-                data, dx, dy, fwhm_guess, nearby_sources=sources)
-            wing_tests[label] = (wx, wy, stability, sat_count, None)
-            print(f'{label}: wing centroid=({wx:.4f}, {wy:.4f}), '
-                  f'PSF difference={math.hypot(wx-fx,wy-fy):.4f} px, '
-                  f'stabilitás={stability:.4f} px')
-        except Exception as exc:
-            wing_tests[label] = (None, None, None, None, str(exc))
-            print(f'{label}: wing centroid unavailable: {exc}')
-    global LAST_WING_TESTS
-    LAST_WING_TESTS = wing_tests
-    # Diagnosztikai adatok: nincs hatásuk a mérési algoritmusra.
-    # A naplót csak a sikeres komponensillesztés után írjuk.
-    global LAST_WIDE_DIAGNOSTICS
-    diagnostics = {
-        "A": (x_a_exp, y_a_exp, dao_ax, dao_ay, x_a, y_a, method_a, psf_a),
-        "B": (x_b_exp, y_b_exp, dao_bx, dao_by, x_b, y_b, method_b, psf_b),
-    }
-    LAST_WIDE_DIAGNOSTICS = diagnostics
-    print("\n--- DUOSTAR CENTROID DIAGNOSTICS ---")
-    for label, (ex, ey, dx, dy, fx, fy, detection, fitter) in diagnostics.items():
-        print(f"{label}: WDS=({float(ex):.4f}, {float(ey):.4f}) "
-              f"detected=({dx:.4f}, {dy:.4f}) "
-              f"fitted=({fx:.4f}, {fy:.4f}) "
-              f"WDS offset={math.hypot(fx-ex,fy-ey):.4f}px "
-              f"detektált-fitted={math.hypot(fx-dx,fy-dy):.4f}px "
-              f"detection={detection} PSF={fitter}")
-    print("--- END OF DIAGNOSTICS ---\n")
-    offset_a = math.hypot(x_a-x_a_exp, y_a-y_a_exp)
-    offset_b = math.hypot(x_b-x_b_exp, y_b-y_b_exp)
-    primary_limit = primary_search + MAX_POSITION_SHIFT_PIX
-    print(f'Wide WDS offsets: A={offset_a:.2f} px (limit={primary_limit:.2f}); '
-          f'B/C={offset_b:.2f} px (limit={companion_search + MAX_POSITION_SHIFT_PIX:.2f})')
-    if offset_a > primary_limit or offset_b > companion_search + MAX_POSITION_SHIFT_PIX:
-        failed = []
-        if offset_a > primary_limit:
-            failed.append(f'A: {offset_a:.2f} px (limit {primary_limit:.2f} px)')
-        if offset_b > companion_search + MAX_POSITION_SHIFT_PIX:
-            failed.append(f'B/C: {offset_b:.2f} px (limit {companion_search + MAX_POSITION_SHIFT_PIX:.2f} px)')
-        raise ValueError('Wide pair: WDS position check failed: ' + '; '.join(failed))
-
-    coord_a = pixel_to_skycoord(x_a, y_a, wcs, origin=0, mode="all")
-    coord_b = pixel_to_skycoord(x_b, y_b, wcs, origin=0, mode="all")
-
-    pa = float(coord_a.position_angle(coord_b).to_value(u.deg) % 360.0)
-    rho = float(coord_a.separation(coord_b).to_value(u.arcsec))
-    pa_diff = abs((pa - row.pa_last + 180.0) % 360.0 - 180.0)
-    if pa_diff > 8.0:
-        raise ValueError(f'Wide pair: PA difference is too large ({pa_diff:.2f}° > 8°); possible misidentification.')
-    dmag = abs(float(-2.5 * math.log10(amp_b / amp_a)))
-
-    # wide mode-ban nincs közös fit RMS; NaN-ként adjuk vissza
-    fit_rms = float("nan")
-    fitted_fwhm = float(fwhm_guess)
-
-    return (
-        pa, rho, dmag,
-        x_a, y_a, x_b, y_b,
-        fit_rms, fitted_fwhm,
-        float(coord_a.ra.deg), float(coord_a.dec.deg),
-        float(coord_b.ra.deg), float(coord_b.dec.deg),
-    )
-
+def measure_wide_pair(data: np.ndarray, wcs: WCS, row: WDSRow, sources,
+                      fwhm_guess: float) -> tuple:
+    """Wide pairs: only DAO centroid astrometry (no PSF or geometry)."""
+    global LAST_WIDE_DIAGNOSTICS, LAST_QUALITY, LAST_WARNINGS, LAST_WING_TESTS
+    LAST_WING_TESTS=None
+    expected_a=row.coord
+    expected_b=expected_a.directional_offset_by(
+        position_angle=row.pa_last*u.deg,separation=row.sep_last*u.arcsec)
+    # Astropy can return 0-D or length-one NumPy arrays from a scalar SkyCoord.
+    # Convert to genuine Python floats before passing coordinates to round().
+    xa_raw, ya_raw = skycoord_to_pixel(expected_a, wcs, origin=0, mode='all')
+    xb_raw, yb_raw = skycoord_to_pixel(expected_b, wcs, origin=0, mode='all')
+    def scalar_pixel(value):
+        arr = np.asarray(value, dtype=float)
+        if arr.size != 1:
+            raise ValueError(f'Expected a scalar WDS pixel coordinate, got shape {arr.shape}')
+        return float(arr.item())
+    xa, ya = scalar_pixel(xa_raw), scalar_pixel(ya_raw)
+    xb, yb = scalar_pixel(xb_raw), scalar_pixel(yb_raw)
+    if not all(np.isfinite([xa,ya,xb,yb])):
+        raise ValueError('Invalid WDS pixel coordinates')
+    ny,nx=data.shape
+    pred_gap=math.hypot(xa-xb,ya-yb)
+    rad_a=12.0  # Allow moderate A-component proper-motion offsets too.
+    rad_b=min(30.,max(12.,.35*pred_gap))
+    margin=max(11,int(math.ceil(2.8*max(1.5,fwhm_guess))))
+    for label,x,y in (('A',xa,ya),('B/C',xb,yb)):
+        if x-margin<0 or y-margin<0 or x+margin>=nx or y+margin>=ny:
+            raise ValueError(f'{label}: too close to FITS boundary')
+    x_a,y_a,method_a,offset_a=_wide_measure_component(
+        data,sources,(xa,ya),rad_a,fwhm_guess,'A')
+    x_b,y_b,method_b,offset_b=_wide_measure_component(
+        data,sources,(xb,yb),rad_b,fwhm_guess,'B/C',other=(x_a,y_a))
+    if math.hypot(x_b-x_a,y_b-y_a) < max(2.,1.2*fwhm_guess):
+        raise ValueError('Wide pair: components not independently resolved')
+    ca=pixel_to_skycoord(x_a,y_a,wcs,origin=0,mode='all')
+    cb=pixel_to_skycoord(x_b,y_b,wcs,origin=0,mode='all')
+    pa=float(ca.position_angle(cb).to_value(u.deg)%360.)
+    rho=float(ca.separation(cb).to_value(u.arcsec))
+    pa_diff=abs((pa-row.pa_last+180.)%360.-180.)
+    sep_diff=100.*(rho/row.sep_last-1.) if row.sep_last>0 else float('nan')
+    if (method_a!='DAO' or method_b!='DAO' or offset_a>6 or offset_b>12
+        or pa_diff>8 or abs(sep_diff)>25):
+        LAST_QUALITY='CHECK'
+        LAST_WARNINGS.append(f'Method A={method_a}, B={method_b}; WDS offsets '
+                             f'{offset_a:.2f}/{offset_b:.2f}px; '
+                             f'dPA={pa_diff:.2f}deg; dSep={sep_diff:+.1f}%')
+    LAST_WIDE_DIAGNOSTICS={
+        'A':(xa,ya,x_a,y_a,x_a,y_a,method_a,method_a),
+        'B':(xb,yb,x_b,y_b,x_b,y_b,method_b,method_b)}
+    print(f'Wide centroids: A={method_a} ({x_a:.3f},{y_a:.3f}); '
+          f'B={method_b} ({x_b:.3f},{y_b:.3f})')
+    return (pa,rho,0.,x_a,y_a,x_b,y_b,float('nan'),float(fwhm_guess),
+            float(ca.ra.deg),float(ca.dec.deg),float(cb.ra.deg),float(cb.dec.deg))
 
 
 def aperture_delta_mag(
@@ -1345,7 +1443,8 @@ def ask_fit_path() -> Path:
 
 
 def write_result_txt(fit_path: Path, row: WDSRow, obs_time: str,
-                     pa: float, rho: float, dmag: float) -> Path:
+                     pa: float, rho: float, dmag: float,
+                     quality: str = "GOOD", warnings=None) -> Path:
     name = re.sub(r'[^A-Za-z0-9_+\-]+', "_", row.pair_name).strip("_")
     out = fit_path.with_name(f"{name}_measurement.txt")
     out.write_text(
@@ -1358,14 +1457,15 @@ def write_result_txt(fit_path: Path, row: WDSRow, obs_time: str,
         f"Mag1 (WDS): {row.mag_a:.2f} mag\n"
         f"Mag2 (calculated): {row.mag_a + dmag:.2f} mag\n"
         f"Delta mag: {abs(dmag):.2f} mag\n\n"
-        f"Quality: GOOD\n",
+        f"Quality: {quality}\n"
+        + ("\n".join("Warning: " + item for item in (warnings or [])) + "\n" if warnings else ""),
         encoding="utf-8",
     )
     return out
 
 
 def main() -> int:
-    global LAST_WIDE_DIAGNOSTICS, LAST_WING_TESTS
+    global LAST_WIDE_DIAGNOSTICS, LAST_WING_TESTS, LAST_QUALITY, LAST_WARNINGS
     print("=" * 68)
     print(f"{APP_NAME} v{VERSION}")
     print("=" * 68)
@@ -1376,8 +1476,8 @@ def main() -> int:
     )
     print("Measurement engine: IsoTool PhotoAnalyzer v1.3")
     print(
-        f'Mode selection: <= {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}" joint PSF fit, '
-        f'> {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}" independent component fitting'
+        f'Mode selection: DAO when separation / FWHM >= {DAO_SEPARATION_FWHM_LIMIT:.1f}; '
+        'otherwise original joint PSF fit'
     )
     print()
 
@@ -1405,44 +1505,67 @@ def main() -> int:
             print("\nMeasurement in progress...")
             LAST_WIDE_DIAGNOSTICS = None
             LAST_WING_TESTS = None
+            LAST_QUALITY = "GOOD"
+            LAST_WARNINGS = []
             header, data, wcs = read_header_and_data(fit_path)
             fwhm_guess, sources = estimate_fwhm_and_sources(data)
             print(f"DAO elődetektálás: {len(sources)} forrás, FWHM~{fwhm_guess:.1f} px")
 
-            if row.sep_last > WIDE_PAIR_THRESHOLD_ARCSEC:
-                print(
-                    f"Wide-pair mode: independent component fitting "
-                    f'(WDS sep > {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}").'
-                )
-                (
-                    pa, rho, dmag_psf,
-                    x_a, y_a, x_b, y_b,
-                    fit_rms, fitted_fwhm,
-                    ra_a, dec_a, ra_b, dec_b,
-                ) = measure_wide_pair(
-                    data=data,
-                    wcs=wcs,
-                    row=row,
-                    sources=sources,
+            # Choose the astrometric method from the *observed* DAO separation,
+            # not the historical WDS separation. DAO never uses PSF/geometry.
+            # PSF remains the original two-star model for genuinely close stars.
+            selected_mode = 'DAO'
+            dao_error = None
+            try:
+                dao_result = measure_wide_pair(
+                    data=data, wcs=wcs, row=row, sources=sources,
                     fwhm_guess=fwhm_guess,
                 )
-            else:
-                print(
-                    f"Close-pair mode: joint two-component PSF fit "
-                    f'(WDS sep <= {WIDE_PAIR_THRESHOLD_ARCSEC:.0f}").'
-                )
-                (
-                    pa, rho, dmag_psf,
-                    x_a, y_a, x_b, y_b,
-                    fit_rms, fitted_fwhm,
-                    ra_a, dec_a, ra_b, dec_b,
-                ) = fit_pair_on_frame(
-                    data=data,
-                    wcs=wcs,
-                    row=row,
-                    sources=sources,
+                dao_gap = math.hypot(dao_result[5]-dao_result[3],
+                                     dao_result[6]-dao_result[4])
+                dao_k = dao_gap / max(float(fwhm_guess), 1e-6)
+                print(f'DAO separation={dao_gap:.3f} px; FWHM={fwhm_guess:.3f} px; K={dao_k:.3f}')
+                if dao_k >= DAO_SEPARATION_FWHM_LIMIT:
+                    print('Measurement mode: DAO centroid (independent stars).')
+                    result_values = dao_result
+                else:
+                    selected_mode = 'PSF'
+                    print(f'K={dao_k:.3f} < {DAO_SEPARATION_FWHM_LIMIT:.1f}: '
+                          'switching to original joint PSF fit.')
+            except ValueError as exc:
+                dao_error = str(exc)
+                # An absent/ambiguous DAO source does not mean the star is blended.
+                # Only attempt PSF if the expected pixel spacing supports a
+                # genuinely close system. WDS provides search positions, not PA/rho.
+                expected_b = row.coord.directional_offset_by(
+                    position_angle=row.pa_last*u.deg,
+                    separation=row.sep_last*u.arcsec)
+                exa, eya = skycoord_to_pixel(row.coord, wcs, origin=0, mode='all')
+                exb, eyb = skycoord_to_pixel(expected_b, wcs, origin=0, mode='all')
+                expected_gap = math.hypot(float(np.asarray(exa).item())-float(np.asarray(exb).item()),
+                                          float(np.asarray(eya).item())-float(np.asarray(eyb).item()))
+                if expected_gap / max(float(fwhm_guess), 1e-6) >= DAO_SEPARATION_FWHM_LIMIT:
+                    raise ValueError('DAO identification failed for an apparently separated pair: '
+                                     + dao_error) from exc
+                selected_mode = 'PSF'
+                print('DAO identification unavailable for a close pair: '
+                      f'{dao_error}; attempting original joint PSF fit.')
+            if selected_mode == 'PSF':
+                # The existing PSF engine is unchanged.
+                LAST_WIDE_DIAGNOSTICS = None
+                LAST_WING_TESTS = None
+                LAST_QUALITY = 'GOOD'
+                LAST_WARNINGS = []
+                result_values = fit_pair_on_frame(
+                    data=data, wcs=wcs, row=row, sources=sources,
                     fwhm_guess=fwhm_guess,
                 )
+            (
+                pa, rho, dmag_psf,
+                x_a, y_a, x_b, y_b,
+                fit_rms, fitted_fwhm,
+                ra_a, dec_a, ra_b, dec_b,
+            ) = result_values
 
             # Egyszerű, reprodukálható asztrometriai napló a FITS mellett.
             # A mérés eredményét és a Quality minősítést nem módosítja.
@@ -1461,7 +1584,7 @@ def main() -> int:
                 lines = [f"DuoStar centroid diagnostics v{VERSION}",
                          f"FITS: {fit_path.name}", f"Object: {row.pair_name}",
                          f"WDS: {row.wds_id}",
-                         f"Mode: {'wide' if row.sep_last > WIDE_PAIR_THRESHOLD_ARCSEC else 'close'}",
+                         f"Mode: {selected_mode}",
                          f"DAO FWHM guess: {fwhm_guess:.4f} px", ""]
                 for label, ex, ey, fx, fy, ra, dec in (
                     ('A', exa, eya, x_a, y_a, ra_a, dec_a),
@@ -1479,7 +1602,7 @@ def main() -> int:
                         lines.extend([
                             f"{label}: detected_pixel = ({dx:.5f}, {dy:.5f})",
                             f"{label}: detection_method = {det}",
-                            f"{label}: psf_method = {psf}",
+                            f"{label}: measurement_method = {psf}",
                             f"{label}: detected_to_fitted_px = {math.hypot(fx-dx,fy-dy):.5f}",
                         ])
                 if LAST_WING_TESTS is not None:
@@ -1512,18 +1635,27 @@ def main() -> int:
                             f'A_PSF_B_WING_PA_deg = {float(ca.position_angle(cb).to_value(u.deg)%360):.5f}',
                             f'A_PSF_B_WING_Separation_arcsec = {float(ca.separation(cb).to_value(u.arcsec)):.5f}',
                         ])
-                lines.extend(["", f"PA_deg = {pa:.5f}", f"Separation_arcsec = {rho:.5f}"])
+                lines.extend(["", f"PA_deg = {pa:.5f}", f"Separation_arcsec = {rho:.5f}",
+                              f"Quality = {LAST_QUALITY}"] +
+                             ["Warning: " + w for w in LAST_WARNINGS])
                 diag_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
                 print(f"Centroid diagnostics saved: {diag_path}")
             except Exception as diag_exc:
                 print(f"Centroid diagnostics not created: {diag_exc}")
 
+            # WDS reference values are advisory; never force the measured PA/rho.
             sep_ratio = rho / row.sep_last if row.sep_last > 0 else np.nan
-            if not np.isfinite(sep_ratio) or not (0.75 <= sep_ratio <= 1.25):
-                raise ValueError(
-                    f'The measured separation ({rho:.2f}") differs too much '
-                    f'from the WDS reference value ({row.sep_last:.2f}").'
-                )
+            if np.isfinite(sep_ratio) and not (0.75 <= sep_ratio <= 1.25):
+                LAST_QUALITY = 'CHECK'
+                msg = f'Measured separation {rho:.2f} arcsec vs WDS {row.sep_last:.2f} arcsec'
+                if msg not in LAST_WARNINGS:
+                    LAST_WARNINGS.append(msg)
+            pa_delta = abs((pa - row.pa_last + 180.0)%360.0 - 180.0)
+            if pa_delta > 8.0:
+                LAST_QUALITY = 'CHECK'
+                msg = f'Position angle differs from WDS by {pa_delta:.2f} deg'
+                if msg not in LAST_WARNINGS:
+                    LAST_WARNINGS.append(msg)
 
             dmag_psf = abs(float(dmag_psf))
 
@@ -1537,12 +1669,13 @@ def main() -> int:
             # A WDS magnitúdók nem szolgálnak kizárási feltételként.
             # A ténylegesen mért (előjeles) Delta mag marad a kimenet alapja.
             print(
-                f"Photometry: PSF Δmag={dmag_psf:.2f}, "
+                f"Photometry: position-model Δmag={dmag_psf:.2f}, "
                 f"AIJ-style aperture Δmag={dmag:.2f}, r={r_ap:.2f} px"
             )
 
             obs_time = observation_time_text(header)
-            out = write_result_txt(fit_path, row, obs_time, pa, rho, dmag)
+            out = write_result_txt(fit_path, row, obs_time, pa, rho, dmag,
+                                   quality=LAST_QUALITY, warnings=LAST_WARNINGS)
 
             print("\nRESULT")
             print("-" * 40)
@@ -1553,7 +1686,9 @@ def main() -> int:
             print(f"Mag1 (WDS): {row.mag_a:.2f} mag")
             print(f"Mag2 (calc): {row.mag_a + dmag:.2f} mag")
             print(f"Delta mag:   {abs(dmag):.2f} mag")
-            print("Quality:     GOOD")
+            print(f"Quality:     {LAST_QUALITY}")
+            for warning in LAST_WARNINGS:
+                print(f"Warning:     {warning}")
             print(f"\nTXT mentve: {out}")
             # Optional image export: a failure here cannot invalidate a valid measurement.
             try:

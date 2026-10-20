@@ -18,12 +18,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
+from astropy import units as u
+from astropy.wcs.utils import skycoord_to_pixel
 
 import photoanalyzer_basic as engine
 
 
 APP_TITLE = "Seestar Double Star Analyzer Basic"
-GUI_VERSION = "1.0.4"
+GUI_VERSION = "1.0.5"
 
 
 def external_app_dir() -> Path:
@@ -324,39 +326,77 @@ class AnalyzerGUI(tk.Tk):
         header, data, wcs = engine.read_header_and_data(fit_path)
         fwhm_guess, sources = engine.estimate_fwhm_and_sources(data)
 
-        if row.sep_last > engine.WIDE_PAIR_THRESHOLD_ARCSEC:
-            (
-                pa, rho, dmag_psf,
-                x_a, y_a, x_b, y_b,
-                fit_rms, fitted_fwhm,
-                ra_a, dec_a, ra_b, dec_b,
-            ) = engine.measure_wide_pair(
-                data=data,
-                wcs=wcs,
-                row=row,
-                sources=sources,
+        # Always attempt independent DAO centroids first. Switch to the
+        # original joint PSF if the observed separation / FWHM is below 3.
+        engine.LAST_QUALITY = "GOOD"
+        engine.LAST_WARNINGS = []
+        engine.LAST_WIDE_DIAGNOSTICS = None
+        engine.LAST_WING_TESTS = None
+        selected_mode = "DAO"
+        try:
+            dao_result = engine.measure_wide_pair(
+                data=data, wcs=wcs, row=row, sources=sources,
                 fwhm_guess=fwhm_guess,
             )
-        else:
-            (
-                pa, rho, dmag_psf,
-                x_a, y_a, x_b, y_b,
-                fit_rms, fitted_fwhm,
-                ra_a, dec_a, ra_b, dec_b,
-            ) = engine.fit_pair_on_frame(
-                data=data,
-                wcs=wcs,
-                row=row,
-                sources=sources,
+            dao_gap = math.hypot(dao_result[5] - dao_result[3],
+                                 dao_result[6] - dao_result[4])
+            k = dao_gap / max(float(fwhm_guess), 1e-6)
+            if k >= engine.DAO_SEPARATION_FWHM_LIMIT:
+                values = dao_result
+            else:
+                selected_mode = "PSF"
+        except ValueError as exc:
+            # Never force PSF on an apparently wide, but ambiguously
+            # identified, pair: it can fit an unrelated star instead.
+            expected_b = row.coord.directional_offset_by(
+                position_angle=row.pa_last * u.deg,
+                separation=row.sep_last * u.arcsec,
+            )
+            exa, eya = skycoord_to_pixel(row.coord, wcs, origin=0, mode="all")
+            exb, eyb = skycoord_to_pixel(expected_b, wcs, origin=0, mode="all")
+            expected_gap = math.hypot(
+                float(np.asarray(exa).item()) - float(np.asarray(exb).item()),
+                float(np.asarray(eya).item()) - float(np.asarray(eyb).item()),
+            )
+            if expected_gap / max(float(fwhm_guess), 1e-6) >= engine.DAO_SEPARATION_FWHM_LIMIT:
+                raise ValueError(
+                    "DAO identification failed for an apparently separated pair: " + str(exc)
+                ) from exc
+            selected_mode = "PSF"
+
+        if selected_mode == "PSF":
+            engine.LAST_WIDE_DIAGNOSTICS = None
+            engine.LAST_WING_TESTS = None
+            engine.LAST_QUALITY = "GOOD"
+            engine.LAST_WARNINGS = []
+            values = engine.fit_pair_on_frame(
+                data=data, wcs=wcs, row=row, sources=sources,
                 fwhm_guess=fwhm_guess,
             )
 
-        sep_ratio = rho / row.sep_last if row.sep_last > 0 else np.nan
-        if not np.isfinite(sep_ratio) or not (0.75 <= sep_ratio <= 1.25):
-            raise ValueError(
-                f'The measured separation ({rho:.2f}") differs too much '
-                f'from the WDS reference value ({row.sep_last:.2f}").'
-            )
+        (
+            pa, rho, dmag_psf,
+            x_a, y_a, x_b, y_b,
+            fit_rms, fitted_fwhm,
+            ra_a, dec_a, ra_b, dec_b,
+        ) = values
+
+        # WDS separation and PA are advisory, not acceptance criteria.
+        warnings = list(getattr(engine, "LAST_WARNINGS", []))
+        quality = getattr(engine, "LAST_QUALITY", "GOOD")
+        if row.sep_last > 0:
+            ratio = rho / row.sep_last
+            if np.isfinite(ratio) and not 0.75 <= ratio <= 1.25:
+                quality = "CHECK"
+                warning = f'Measured separation {rho:.2f} arcsec vs WDS {row.sep_last:.2f} arcsec'
+                if warning not in warnings:
+                    warnings.append(warning)
+        pa_delta = abs((pa - row.pa_last + 180.0) % 360.0 - 180.0)
+        if pa_delta > 8.0:
+            quality = "CHECK"
+            warning = f'Position angle differs from WDS by {pa_delta:.2f} deg'
+            if warning not in warnings:
+                warnings.append(warning)
 
         dmag, flux_a, flux_b, r_ap = engine.aperture_delta_mag(
             data=data,
@@ -370,7 +410,8 @@ class AnalyzerGUI(tk.Tk):
 
         obs_time = engine.observation_time_text(header)
         out = engine.write_result_txt(
-            fit_path, row, obs_time, pa, rho, dmag
+            fit_path, row, obs_time, pa, rho, dmag,
+            quality=quality, warnings=warnings,
         )
 
         png = None
@@ -392,10 +433,12 @@ class AnalyzerGUI(tk.Tk):
             "dmag": abs(float(dmag)),
             "mag1": float(row.mag_a),
             "mag2": float(row.mag_a) + float(dmag),
-            "quality": "GOOD",
+            "quality": quality,
             "saved": out,
             "png": png,
             "image_error": image_error,
+            "mode": selected_mode,
+            "warnings": warnings,
         }
 
     def _measurement_success(self, result):
@@ -406,12 +449,14 @@ class AnalyzerGUI(tk.Tk):
         self.result_vars["Mag1"].set(f'{result["mag1"]:.2f} mag')
         self.result_vars["Mag2"].set(f'{result["mag2"]:.2f} mag')
         self.result_vars["Delta mag"].set(f'{result["dmag"]:.2f} mag')
-        self.result_vars["Quality"].set(result["quality"])
+        self.result_vars["Quality"].set(result["quality"] + " (" + result["mode"] + ")")
         saved_text = f'TXT saved: {result["saved"]}'
         if result["png"]:
             saved_text += f'\nPNG saved: {result["png"]}'
         else:
             saved_text += f'\nPNG not created: {result["image_error"]}'
+        if result["warnings"]:
+            saved_text += "\n" + "; ".join(result["warnings"])
         self.saved_var.set(saved_text)
         self.status_text.set("Measurement completed.")
         self.measure_button.configure(state="normal")
